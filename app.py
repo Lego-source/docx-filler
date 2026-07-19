@@ -2,10 +2,10 @@ import base64
 import io
 import re
 import zipfile
+import copy
 from flask import Flask, request, Response
 
 from docx import Document
-import copy
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
@@ -43,7 +43,7 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Заміна в абзаці зі збереженням форматування ----------
+# ---------- Заміна в абзаці ----------
 
 def replace_in_paragraph(paragraph, pattern, lookup):
     runs = paragraph.runs
@@ -127,21 +127,21 @@ def apply_placeholders(doc, data_map):
 
 # ---------- ТВО-вставка ----------
 
-# Текст-якір, за яким шукаємо початок/кінець ТВО-блоку в шаблоні-донорі (№2)
+# У шаблоні-донорі (№2) ТВО-блок починається з цієї фрази і закінчується
+# абзацом підпису ТВО, що містить «ТВО_ім» «ТВО_фам».
 TVO_START_MARK = 'прошу покласти тимчасове виконання'
-TVO_END_MARK   = 'тво_фам'   # останній абзац блоку містить «ТВО_ім» «ТВО_фам»
+TVO_END_MARK   = 'тво_фам'
 
-# Якір у цільовому шаблоні, ПІСЛЯ якого вставляємо блок:
-# рядок підпису заявника, що містить одночасно «зван», «ім», «фам».
+# У ЦІЛЬОВОМУ шаблоні вставляємо блок ПІСЛЯ абзацу з адресою відпустки,
+# тобто ПЕРЕД підписом заявника.
+ANCHOR_MARK = 'відпустку буду проводити за адресою'
+
+
 def paragraph_plain_text(p):
     return ''.join(r.text for r in p.runs)
 
-def is_applicant_signature(p):
-    t = paragraph_plain_text(p).lower()
-    return ('\u00abзван\u00bb' in t) and ('\u00abім\u00bb' in t or '\u00abiм\u00bb' in t) and ('\u00abфам\u00bb' in t)
 
 def find_tvo_block_paragraphs(donor_doc):
-    """Повертає список глибоких копій XML-елементів абзаців ТВО-блоку з шаблону-донора."""
     paras = donor_doc.paragraphs
     start = None
     end = None
@@ -154,52 +154,48 @@ def find_tvo_block_paragraphs(donor_doc):
             break
     if start is None or end is None or end < start:
         return None
-    block = []
-    for i in range(start, end + 1):
-        block.append(copy.deepcopy(paras[i]._p))
-    return block
+    return [copy.deepcopy(paras[i]._p) for i in range(start, end + 1)]
+
+
+def find_anchor_paragraph(doc):
+    """Абзац з адресою відпустки — вставляємо ТВО одразу після нього."""
+    for p in doc.paragraphs:
+        if ANCHOR_MARK in paragraph_plain_text(p).lower():
+            return p
+    return None
+
 
 def insert_tvo_block(target_doc, donor_doc):
-    """Вставляє ТВО-блок з донора в цільовий документ після підпису заявника.
-       Повертає True, якщо вставлено; False, якщо не знайдено якорів."""
     block = find_tvo_block_paragraphs(donor_doc)
     if not block:
-        return False
-    # знаходимо якір у цільовому документі
-    anchor = None
-    for p in target_doc.paragraphs:
-        if is_applicant_signature(p):
-            anchor = p
+        return False, 'donor'
+    anchor = find_anchor_paragraph(target_doc)
     if anchor is None:
-        return False
-    # вставляємо копії абзаців одразу після якоря (у зворотному порядку,
-    # бо кожен addnext ставить елемент безпосередньо після якоря)
+        return False, 'anchor'
     ref = anchor._p
     for para_xml in block:
         ref.addnext(para_xml)
         ref = para_xml
-    return True
+    return True, None
 
-
-# ---------- Заповнення одного документа ----------
 
 def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
     doc = Document(io.BytesIO(docx_bytes))
-
     tvo_note = None
     if add_tvo:
         if tvo_donor_bytes is None:
-            tvo_note = 'ТВО: не передано шаблон-донор (№2) для вставки блоку.'
+            tvo_note = 'ТВО: не передано шаблон-донор (№2).'
         else:
             donor = Document(io.BytesIO(tvo_donor_bytes))
-            ok = insert_tvo_block(doc, donor)
+            ok, why = insert_tvo_block(doc, donor)
             if not ok:
-                tvo_note = ('ТВО: не вдалося знайти місце для вставки блоку '
-                            '(перевірте, що в донорі є текст «Прошу покласти тимчасове виконання…», '
-                            'а в цьому шаблоні — рядок підпису «зван» «ім» «фам»).')
-
+                if why == 'donor':
+                    tvo_note = ('ТВО: у доноровому шаблоні №2 не знайдено блок '
+                                '(«Прошу покласти тимчасове виконання…» … «ТВО_ім» «ТВО_фам»).')
+                else:
+                    tvo_note = ('ТВО: у цьому шаблоні не знайдено абзац-якір '
+                                '«Відпустку буду проводити за адресою…» для вставки блоку.')
     apply_placeholders(doc, data_map)
-
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue(), tvo_note
@@ -211,9 +207,11 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
 def root():
     return 'DOCX filler service is running.', 200
 
+
 @app.route('/health', methods=['GET'])
 def health():
     return 'ok', 200
+
 
 @app.route('/generate', methods=['POST'])
 def generate():
@@ -236,7 +234,6 @@ def generate():
             for f in person.get('files', []):
                 out_name = f.get('outName', 'file.docx')
                 b64 = f.get('templateB64', '')
-                # чи додавати ТВО саме до цього файлу (визначає Apps Script)
                 file_add_tvo = add_tvo and bool(f.get('allowTvo', True))
                 if not b64:
                     continue
