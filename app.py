@@ -126,39 +126,62 @@ def apply_placeholders(doc, data_map):
 
 
 # ---------- ТВО-вставка ----------
+#
+# У доноровому шаблоні №2 ТВО-текст складається з ДВОХ частин, між якими
+# стоїть підпис заявника (його НЕ копіюємо):
+#   Частина А: абзац «Прошу покласти тимчасове виконання…»
+#   Частина Б: «Не заперечую.» → «ПосадаТВО»… → «ТВО_зван» … «ТВО_ім» «ТВО_фам»
+#
+# У цільовий шаблон вставляємо А та Б поспіль ПІСЛЯ абзацу з адресою відпустки
+# (тобто перед підписом заявника цільового документа).
 
-# У шаблоні-донорі (№2) ТВО-блок починається з цієї фрази і закінчується
-# абзацом підпису ТВО, що містить «ТВО_ім» «ТВО_фам».
-TVO_START_MARK = 'прошу покласти тимчасове виконання'
-TVO_END_MARK   = 'тво_фам'
-
-# У ЦІЛЬОВОМУ шаблоні вставляємо блок ПІСЛЯ абзацу з адресою відпустки,
-# тобто ПЕРЕД підписом заявника.
-ANCHOR_MARK = 'відпустку буду проводити за адресою'
+TVO_A_MARK   = 'прошу покласти тимчасове виконання'
+TVO_B_START  = 'не заперечую'
+TVO_B_END    = 'тво_фам'     # останній абзац Б містить «ТВО_ім» «ТВО_фам»
+ANCHOR_MARK  = 'відпустку буду проводити за адресою'
 
 
 def paragraph_plain_text(p):
     return ''.join(r.text for r in p.runs)
 
 
-def find_tvo_block_paragraphs(donor_doc):
+def collect_tvo_block(donor_doc):
+    """Повертає список глибоких копій абзаців: частина А + частина Б
+       (без підпису заявника між ними). None, якщо якорі не знайдено."""
     paras = donor_doc.paragraphs
-    start = None
-    end = None
+
+    # Частина А — один абзац
+    a_idx = None
     for i, p in enumerate(paras):
-        low = paragraph_plain_text(p).lower()
-        if start is None and TVO_START_MARK in low:
-            start = i
-        if start is not None and TVO_END_MARK in low.replace(' ', ''):
-            end = i
+        if TVO_A_MARK in paragraph_plain_text(p).lower():
+            a_idx = i
             break
-    if start is None or end is None or end < start:
+    if a_idx is None:
         return None
-    return [copy.deepcopy(paras[i]._p) for i in range(start, end + 1)]
+
+    # Частина Б — від «Не заперечую» до абзацу з «ТВО_ім» «ТВО_фам»
+    b_start = None
+    for i in range(a_idx + 1, len(paras)):
+        if TVO_B_START in paragraph_plain_text(paras[i]).lower():
+            b_start = i
+            break
+    if b_start is None:
+        return None
+    b_end = None
+    for i in range(b_start, len(paras)):
+        if TVO_B_END in paragraph_plain_text(paras[i]).lower().replace(' ', ''):
+            b_end = i
+            break
+    if b_end is None:
+        return None
+
+    result = [copy.deepcopy(paras[a_idx]._p)]
+    for i in range(b_start, b_end + 1):
+        result.append(copy.deepcopy(paras[i]._p))
+    return result
 
 
 def find_anchor_paragraph(doc):
-    """Абзац з адресою відпустки — вставляємо ТВО одразу після нього."""
     for p in doc.paragraphs:
         if ANCHOR_MARK in paragraph_plain_text(p).lower():
             return p
@@ -166,7 +189,7 @@ def find_anchor_paragraph(doc):
 
 
 def insert_tvo_block(target_doc, donor_doc):
-    block = find_tvo_block_paragraphs(donor_doc)
+    block = collect_tvo_block(donor_doc)
     if not block:
         return False, 'donor'
     anchor = find_anchor_paragraph(target_doc)
@@ -190,11 +213,11 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
             ok, why = insert_tvo_block(doc, donor)
             if not ok:
                 if why == 'donor':
-                    tvo_note = ('ТВО: у доноровому шаблоні №2 не знайдено блок '
-                                '(«Прошу покласти тимчасове виконання…» … «ТВО_ім» «ТВО_фам»).')
+                    tvo_note = ('ТВО: у доноровому шаблоні №2 не знайдено потрібні абзаци '
+                                '(«Прошу покласти тимчасове виконання…», «Не заперечую», підпис ТВО).')
                 else:
                     tvo_note = ('ТВО: у цьому шаблоні не знайдено абзац-якір '
-                                '«Відпустку буду проводити за адресою…» для вставки блоку.')
+                                '«Відпустку буду проводити за адресою…».')
     apply_placeholders(doc, data_map)
     out = io.BytesIO()
     doc.save(out)
