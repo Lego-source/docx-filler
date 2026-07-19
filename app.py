@@ -125,80 +125,102 @@ def apply_placeholders(doc, data_map):
                 pass
 
 
-# ---------- ТВО-вставка ----------
+# ---------- ТВО-вставка (дві точки) ----------
 #
-# У доноровому шаблоні №2 ТВО-текст складається з ДВОХ частин, між якими
-# стоїть підпис заявника (його НЕ копіюємо):
-#   Частина А: абзац «Прошу покласти тимчасове виконання…»
-#   Частина Б: «Не заперечую.» → «ПосадаТВО»… → «ТВО_зван» … «ТВО_ім» «ТВО_фам»
-#
-# У цільовий шаблон вставляємо А та Б поспіль ПІСЛЯ абзацу з адресою відпустки
-# (тобто перед підписом заявника цільового документа).
+# Частина А: абзац «Прошу покласти тимчасове виконання…»
+#   → вставляємо ПІСЛЯ абзацу з адресою відпустки (перед підписом заявника).
+# Частина Б: «Не заперечую.» → «ПосадаТВО»… → підпис ТВО («ТВО_ім» «ТВО_фам»)
+#   → вставляємо ПІСЛЯ підпису заявника (рядок зі «зван»/«ім»/«фам»).
 
 TVO_A_MARK   = 'прошу покласти тимчасове виконання'
 TVO_B_START  = 'не заперечую'
-TVO_B_END    = 'тво_фам'     # останній абзац Б містить «ТВО_ім» «ТВО_фам»
-ANCHOR_MARK  = 'відпустку буду проводити за адресою'
+TVO_B_END    = 'тво_фам'
+ANCHOR_ADDR  = 'відпустку буду проводити за адресою'
 
 
 def paragraph_plain_text(p):
     return ''.join(r.text for r in p.runs)
 
 
-def collect_tvo_block(donor_doc):
-    """Повертає список глибоких копій абзаців: частина А + частина Б
-       (без підпису заявника між ними). None, якщо якорі не знайдено."""
+def get_tvo_parts(donor_doc):
+    """Повертає (partA_xml_list, partB_xml_list) або (None,None)."""
     paras = donor_doc.paragraphs
 
-    # Частина А — один абзац
     a_idx = None
     for i, p in enumerate(paras):
         if TVO_A_MARK in paragraph_plain_text(p).lower():
             a_idx = i
             break
     if a_idx is None:
-        return None
+        return None, None
 
-    # Частина Б — від «Не заперечую» до абзацу з «ТВО_ім» «ТВО_фам»
     b_start = None
     for i in range(a_idx + 1, len(paras)):
         if TVO_B_START in paragraph_plain_text(paras[i]).lower():
             b_start = i
             break
     if b_start is None:
-        return None
+        return None, None
     b_end = None
     for i in range(b_start, len(paras)):
         if TVO_B_END in paragraph_plain_text(paras[i]).lower().replace(' ', ''):
             b_end = i
             break
     if b_end is None:
-        return None
+        return None, None
 
-    result = [copy.deepcopy(paras[a_idx]._p)]
-    for i in range(b_start, b_end + 1):
-        result.append(copy.deepcopy(paras[i]._p))
-    return result
+    part_a = [copy.deepcopy(paras[a_idx]._p)]
+    part_b = [copy.deepcopy(paras[i]._p) for i in range(b_start, b_end + 1)]
+    return part_a, part_b
 
 
-def find_anchor_paragraph(doc):
+def find_addr_anchor(doc):
     for p in doc.paragraphs:
-        if ANCHOR_MARK in paragraph_plain_text(p).lower():
+        if ANCHOR_ADDR in paragraph_plain_text(p).lower():
             return p
     return None
 
 
+def is_applicant_signature(p):
+    t = paragraph_plain_text(p).lower()
+    return ('\u00abзван\u00bb' in t) and ('\u00abім\u00bb' in t or '\u00abiм\u00bb' in t) and ('\u00abфам\u00bb' in t)
+
+
+def find_applicant_signature(doc):
+    """Останній абзац-підпис заявника (містить «зван» «ім» «фам»)."""
+    found = None
+    for p in doc.paragraphs:
+        if is_applicant_signature(p):
+            found = p
+    return found
+
+
 def insert_tvo_block(target_doc, donor_doc):
-    block = collect_tvo_block(donor_doc)
-    if not block:
+    part_a, part_b = get_tvo_parts(donor_doc)
+    if not part_a or not part_b:
         return False, 'donor'
-    anchor = find_anchor_paragraph(target_doc)
-    if anchor is None:
-        return False, 'anchor'
-    ref = anchor._p
-    for para_xml in block:
+
+    addr = find_addr_anchor(target_doc)
+    if addr is None:
+        return False, 'anchor_addr'
+
+    sign = find_applicant_signature(target_doc)
+    if sign is None:
+        return False, 'anchor_sign'
+
+    # Частина Б — після підпису заявника
+    ref = sign._p
+    for para_xml in part_b:
         ref.addnext(para_xml)
         ref = para_xml
+
+    # Частина А — після абзацу з адресою (робимо це ПІСЛЯ Б, бо якорі різні
+    # й не заважають один одному; підпис заявника лишається на місці)
+    ref = addr._p
+    for para_xml in part_a:
+        ref.addnext(para_xml)
+        ref = para_xml
+
     return True, None
 
 
@@ -212,12 +234,12 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
             donor = Document(io.BytesIO(tvo_donor_bytes))
             ok, why = insert_tvo_block(doc, donor)
             if not ok:
-                if why == 'donor':
-                    tvo_note = ('ТВО: у доноровому шаблоні №2 не знайдено потрібні абзаци '
-                                '(«Прошу покласти тимчасове виконання…», «Не заперечую», підпис ТВО).')
-                else:
-                    tvo_note = ('ТВО: у цьому шаблоні не знайдено абзац-якір '
-                                '«Відпустку буду проводити за адресою…».')
+                notes = {
+                    'donor': 'ТВО: у доноровому шаблоні №2 не знайдено потрібні абзаци.',
+                    'anchor_addr': 'ТВО: не знайдено абзац «Відпустку буду проводити за адресою…».',
+                    'anchor_sign': 'ТВО: не знайдено підпис заявника («зван» «ім» «фам») для вставки блоку «Не заперечую».'
+                }
+                tvo_note = notes.get(why, 'ТВО: не вдалося вставити блок.')
     apply_placeholders(doc, data_map)
     out = io.BytesIO()
     doc.save(out)
