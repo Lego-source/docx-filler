@@ -6,6 +6,7 @@ import copy
 from flask import Flask, request, Response
 
 from docx import Document
+from docx.text.paragraph import Paragraph
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
@@ -18,6 +19,10 @@ def normalize_name(s):
     s = s.replace('_', ' ').replace('\u00A0', ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s.lower()
+
+
+def normalize_apostrophes_(s):
+    return (s or '').replace('\u2019', "'").replace('\u02bc', "'")
 
 
 def build_matcher(data_map):
@@ -125,12 +130,23 @@ def apply_placeholders(doc, data_map):
                 pass
 
 
-# ---------- ТВО-вставка (дві точки) ----------
-#
-# Частина А: абзац «Прошу покласти тимчасове виконання…»
-#   → вставляємо ПІСЛЯ абзацу з адресою відпустки (перед підписом заявника).
-# Частина Б: «Не заперечую.» → «ПосадаТВО»… → підпис ТВО («ТВО_ім» «ТВО_фам»)
-#   → вставляємо ПІСЛЯ підпису заявника (рядок зі «зван»/«ім»/«фам»).
+# ---------- Вставка нового абзацу після якоря (спільна допоміжна) ----------
+
+def insert_paragraph_after(anchor_paragraph, text):
+    new_p = copy.deepcopy(anchor_paragraph._p)
+    anchor_paragraph._p.addnext(new_p)
+    new_para = Paragraph(new_p, anchor_paragraph._parent)
+    runs = new_para.runs
+    if runs:
+        runs[0].text = text
+        for r in runs[1:]:
+            r.text = ''
+    else:
+        new_para.add_run(text)
+    return new_para
+
+
+# ---------- ТВО-вставка (без змін) ----------
 
 TVO_A_MARK   = 'прошу покласти тимчасове виконання'
 TVO_B_START  = 'не заперечую'
@@ -143,9 +159,7 @@ def paragraph_plain_text(p):
 
 
 def get_tvo_parts(donor_doc):
-    """Повертає (partA_xml_list, partB_xml_list) або (None,None)."""
     paras = donor_doc.paragraphs
-
     a_idx = None
     for i, p in enumerate(paras):
         if TVO_A_MARK in paragraph_plain_text(p).lower():
@@ -153,7 +167,6 @@ def get_tvo_parts(donor_doc):
             break
     if a_idx is None:
         return None, None
-
     b_start = None
     for i in range(a_idx + 1, len(paras)):
         if TVO_B_START in paragraph_plain_text(paras[i]).lower():
@@ -168,7 +181,6 @@ def get_tvo_parts(donor_doc):
             break
     if b_end is None:
         return None, None
-
     part_a = [copy.deepcopy(paras[a_idx]._p)]
     part_b = [copy.deepcopy(paras[i]._p) for i in range(b_start, b_end + 1)]
     return part_a, part_b
@@ -187,7 +199,6 @@ def is_applicant_signature(p):
 
 
 def find_applicant_signature(doc):
-    """Останній абзац-підпис заявника (містить «зван» «ім» «фам»)."""
     found = None
     for p in doc.paragraphs:
         if is_applicant_signature(p):
@@ -199,33 +210,49 @@ def insert_tvo_block(target_doc, donor_doc):
     part_a, part_b = get_tvo_parts(donor_doc)
     if not part_a or not part_b:
         return False, 'donor'
-
     addr = find_addr_anchor(target_doc)
     if addr is None:
         return False, 'anchor_addr'
-
     sign = find_applicant_signature(target_doc)
     if sign is None:
         return False, 'anchor_sign'
-
-    # Частина Б — після підпису заявника
     ref = sign._p
     for para_xml in part_b:
         ref.addnext(para_xml)
         ref = para_xml
-
-    # Частина А — після абзацу з адресою (робимо це ПІСЛЯ Б, бо якорі різні
-    # й не заважають один одному; підпис заявника лишається на місці)
     ref = addr._p
     for para_xml in part_a:
         ref.addnext(para_xml)
         ref = para_xml
-
     return True, None
 
 
-def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
+# ---------- НОВЕ: пункт 8 контракту для військовослужбовців 45+ ----------
+
+AGE_CLAUSE_ANCHOR = 'перебування у стані алкогольного'
+AGE_CLAUSE_TEXT = (
+    "Після закінчення особливого періоду, у разі досягнення військовослужбовцем "
+    "граничного віку перебування на військовій службі, контракт припиняється "
+    "(розривається), а військовослужбовець підлягає звільненню з військової служби за віком."
+)
+
+
+def insert_age_clause(doc):
+    """Шукає абзац з ознакою пункту 8 («...стані алкогольного...») і дописує
+       після нього додаткове речення. Повертає True, якщо знайдено й вставлено."""
+    for p in doc.paragraphs:
+        text = normalize_apostrophes_(''.join(r.text for r in p.runs)).lower()
+        if AGE_CLAUSE_ANCHOR in text:
+            insert_paragraph_after(p, AGE_CLAUSE_TEXT)
+            return True
+    return False
+
+
+# ---------- Заповнення одного документа ----------
+
+def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False, add_age_clause=False):
     doc = Document(io.BytesIO(docx_bytes))
+
     tvo_note = None
     if add_tvo:
         if tvo_donor_bytes is None:
@@ -240,10 +267,29 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False):
                     'anchor_sign': 'ТВО: не знайдено підпис заявника («зван» «ім» «фам») для вставки блоку «Не заперечую».'
                 }
                 tvo_note = notes.get(why, 'ТВО: не вдалося вставити блок.')
+
+    age_note = None
+    if add_age_clause:
+        found = insert_age_clause(doc)
+        if not found:
+            # М'яке попередження: людині 45+, але в ЦЬОМУ конкретному файлі
+            # не знайдено пункт 8 — можливо, у нього просто немає такого абзацу
+            # (наприклад, це не сам текст контракту, а супровідний документ).
+            age_note = ('Вік 45+: пункт 8 не знайдено в цьому файлі '
+                        '(очікувався абзац «...перебування у стані алкогольного...»).')
+
     apply_placeholders(doc, data_map)
+
     out = io.BytesIO()
     doc.save(out)
-    return out.getvalue(), tvo_note
+
+    note = None
+    if tvo_note and age_note:
+        note = tvo_note + '\n' + age_note
+    else:
+        note = tvo_note or age_note
+
+    return out.getvalue(), note
 
 
 # ---------- Маршрути ----------
@@ -273,6 +319,7 @@ def generate():
             folder = person.get('folder', '') or ''
             data_map = person.get('data', {}) or {}
             add_tvo = bool(person.get('addTvo', False))
+            add_age_clause = bool(person.get('addAgeClause', False))
             tvo_donor_b64 = person.get('tvoDonorB64')
             tvo_donor_bytes = base64.b64decode(tvo_donor_b64) if tvo_donor_b64 else None
 
@@ -287,7 +334,8 @@ def generate():
                     filled, note = fill_document(
                         template_bytes, data_map,
                         tvo_donor_bytes=tvo_donor_bytes,
-                        add_tvo=file_add_tvo
+                        add_tvo=file_add_tvo,
+                        add_age_clause=add_age_clause
                     )
                 except Exception as e:
                     err = ('Помилка обробки: ' + str(e)).encode('utf-8')
@@ -297,7 +345,7 @@ def generate():
                 path = (folder + '/' if folder else '') + out_name
                 zf.writestr(path, filled)
                 if note:
-                    zf.writestr(path + '.ТВО-увага.txt', note.encode('utf-8'))
+                    zf.writestr(path + '.УВАГА.txt', note.encode('utf-8'))
 
     return Response(
         mem.getvalue(),
