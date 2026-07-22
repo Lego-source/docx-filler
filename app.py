@@ -25,6 +25,17 @@ def normalize_apostrophes_(s):
     return (s or '').replace('\u2019', "'").replace('\u02bc', "'")
 
 
+# Максимально «толерантна» нормалізація для пошуку якорів:
+# прибирає будь-які варіанти апострофа й схлопує пробіли/невидимі пробіли.
+def normalize_for_anchor_(s):
+    s = (s or '').lower()
+    s = s.replace('\u00A0', ' ')
+    for ch in ["'", '\u2019', '\u02bc', '\u0060', '\u00B4']:
+        s = s.replace(ch, '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
 def build_matcher(data_map):
     lookup = {}
     names = []
@@ -227,9 +238,12 @@ def insert_tvo_block(target_doc, donor_doc):
     return True, None
 
 
-# ---------- НОВЕ: пункт 8 контракту для військовослужбовців 45+ ----------
+# ---------- Пункт 8 контракту для військовослужбовців 45+ ----------
 
-AGE_CLAUSE_ANCHOR = 'перебування у стані алкогольного'
+# Короткий, стійкий якір: одне характерне слово, без апострофа (порівнюємо
+# після видалення будь-яких варіантів апострофа з обох боків).
+AGE_CLAUSE_ANCHOR_NORM = 'спяніння'
+
 AGE_CLAUSE_TEXT = (
     "Після закінчення особливого періоду, у разі досягнення військовослужбовцем "
     "граничного віку перебування на військовій службі, контракт припиняється "
@@ -238,11 +252,11 @@ AGE_CLAUSE_TEXT = (
 
 
 def insert_age_clause(doc):
-    """Шукає абзац з ознакою пункту 8 («...стані алкогольного...») і дописує
-       після нього додаткове речення. Повертає True, якщо знайдено й вставлено."""
-    for p in doc.paragraphs:
-        text = normalize_apostrophes_(''.join(r.text for r in p.runs)).lower()
-        if AGE_CLAUSE_ANCHOR in text:
+    """Шукає абзац з характерним словом «сп'яніння» (включно з таблицями!)
+       і дописує після нього додаткове речення. True — якщо вставлено."""
+    for p in collect_paragraphs(doc):
+        text = normalize_for_anchor_(''.join(r.text for r in p.runs))
+        if AGE_CLAUSE_ANCHOR_NORM in text:
             insert_paragraph_after(p, AGE_CLAUSE_TEXT)
             return True
     return False
@@ -250,7 +264,8 @@ def insert_age_clause(doc):
 
 # ---------- Заповнення одного документа ----------
 
-def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False, add_age_clause=False):
+def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
+                  add_age_clause=False, warn_if_age_clause_missing=False):
     doc = Document(io.BytesIO(docx_bytes))
 
     tvo_note = None
@@ -271,12 +286,11 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False, add
     age_note = None
     if add_age_clause:
         found = insert_age_clause(doc)
-        if not found:
-            # М'яке попередження: людині 45+, але в ЦЬОМУ конкретному файлі
-            # не знайдено пункт 8 — можливо, у нього просто немає такого абзацу
-            # (наприклад, це не сам текст контракту, а супровідний документ).
-            age_note = ('Вік 45+: пункт 8 не знайдено в цьому файлі '
-                        '(очікувався абзац «...перебування у стані алкогольного...»).')
+        if not found and warn_if_age_clause_missing:
+            # Повідомляємо тільки для файлу, який схожий на сам контракт
+            # (щоб не засмічувати архів попередженнями по всіх інших документах).
+            age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
+                        'для вставки пункту 8 у цьому файлі.')
 
     apply_placeholders(doc, data_map)
 
@@ -327,6 +341,9 @@ def generate():
                 out_name = f.get('outName', 'file.docx')
                 b64 = f.get('templateB64', '')
                 file_add_tvo = add_tvo and bool(f.get('allowTvo', True))
+                # Попередження про відсутній пункт 8 показуємо лише для файлу,
+                # у назві якого є слово "контракт" — саме він мав би містити цей пункт.
+                looks_like_contract = 'контракт' in out_name.lower()
                 if not b64:
                     continue
                 try:
@@ -335,7 +352,8 @@ def generate():
                         template_bytes, data_map,
                         tvo_donor_bytes=tvo_donor_bytes,
                         add_tvo=file_add_tvo,
-                        add_age_clause=add_age_clause
+                        add_age_clause=add_age_clause,
+                        warn_if_age_clause_missing=looks_like_contract
                     )
                 except Exception as e:
                     err = ('Помилка обробки: ' + str(e)).encode('utf-8')
