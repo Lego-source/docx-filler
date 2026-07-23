@@ -13,7 +13,9 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-23-leadership-v6-idtrack"
+APP_VERSION = "2026-07-23-mergefield-v7"
+
+W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
 
 # ---------- Нормалізація ----------
@@ -198,20 +200,122 @@ def replace_in_paragraph(paragraph, pattern, lookup):
             runs[last_i].text = suffix
 
 
+# ---------- НОВЕ: обробка справжніх Word MERGEFIELD ----------
+# (на відміну від «...»-плейсхолдерів — це закешовані поля злиття,
+#  що лишились у частині шаблонів зі старої, доцифрової епохи)
+
+def get_field_char_type(run_xml):
+    fldChar = run_xml.find(f'{W_NS}fldChar')
+    return fldChar.get(f'{W_NS}fldCharType') if fldChar is not None else None
+
+
+def get_instr_text(run_xml):
+    instr = run_xml.find(f'{W_NS}instrText')
+    return (instr.text or '') if instr is not None else None
+
+
+def extract_mergefield_name(instr_text):
+    s = instr_text.strip()
+    if not s.upper().startswith('MERGEFIELD'):
+        return None
+    rest = s[len('MERGEFIELD'):].strip()
+    idx = rest.find('\\')
+    if idx != -1:
+        rest = rest[:idx]
+    rest = rest.strip()
+    if len(rest) >= 2 and rest[0] == '"' and rest[-1] == '"':
+        rest = rest[1:-1]
+    return rest.strip()
+
+
+def process_mergefields_in_paragraph(paragraph, lookup):
+    """Знаходить справжні MERGEFIELD (fldChar begin/separate/end) і оновлює
+       їхній закешований результат на актуальне значення з lookup —
+       тією самою мапою даних, що й «...»-плейсхолдери."""
+    runs = list(paragraph.runs)
+    i = 0
+    changed = False
+    guard = 0
+    while i < len(runs):
+        guard += 1
+        if guard > 500:
+            break
+        fctype = get_field_char_type(runs[i]._r)
+        if fctype == 'begin':
+            j = i + 1
+            field_name = None
+            steps = 0
+            while j < len(runs) and get_field_char_type(runs[j]._r) != 'separate':
+                instr = get_instr_text(runs[j]._r)
+                if instr and field_name is None:
+                    name = extract_mergefield_name(instr)
+                    if name:
+                        field_name = name
+                j += 1
+                steps += 1
+                if steps > 30:
+                    break
+            if j < len(runs) and get_field_char_type(runs[j]._r) == 'separate':
+                k = j + 1
+                end_k = None
+                steps2 = 0
+                while k < len(runs):
+                    if get_field_char_type(runs[k]._r) == 'end':
+                        end_k = k
+                        break
+                    k += 1
+                    steps2 += 1
+                    if steps2 > 30:
+                        break
+                if end_k is not None and field_name:
+                    norm = normalize_name(field_name)
+                    value = lookup.get(norm)
+                    if value is not None:
+                        result_runs = runs[j + 1:end_k]
+                        if result_runs:
+                            result_runs[0].text = str(value)
+                            for rr in result_runs[1:]:
+                                rr.text = ''
+                            changed = True
+                if end_k is not None:
+                    i = end_k + 1
+                    continue
+        i += 1
+    return changed
+
+
+def apply_mergefields(doc, lookup):
+    changed = False
+    for p in collect_paragraphs(doc):
+        if process_mergefields_in_paragraph(p, lookup):
+            changed = True
+    for container in all_containers(doc):
+        if container is doc:
+            continue
+        try:
+            for p in collect_paragraphs(container):
+                if process_mergefields_in_paragraph(p, lookup):
+                    changed = True
+        except Exception:
+            pass
+    return changed
+
+
 def apply_placeholders(doc, data_map):
     pattern, lookup = build_matcher(data_map)
-    if pattern is None:
-        return
-    for p in collect_paragraphs(doc):
-        replace_in_paragraph(p, pattern, lookup)
-    for section in doc.sections:
-        for hf in (section.header, section.first_page_header, section.even_page_header,
-                   section.footer, section.first_page_footer, section.even_page_footer):
-            try:
-                for p in collect_paragraphs(hf):
-                    replace_in_paragraph(p, pattern, lookup)
-            except Exception:
-                pass
+    if pattern is not None:
+        for p in collect_paragraphs(doc):
+            replace_in_paragraph(p, pattern, lookup)
+        for section in doc.sections:
+            for hf in (section.header, section.first_page_header, section.even_page_header,
+                       section.footer, section.first_page_footer, section.even_page_footer):
+                try:
+                    for p in collect_paragraphs(hf):
+                        replace_in_paragraph(p, pattern, lookup)
+                except Exception:
+                    pass
+    # Окремо — справжні MERGEFIELD (та сама мапа даних, інший формат носія)
+    apply_mergefields(doc, lookup if pattern is not None else {})
 
 
 # ---------- Вставка нового абзацу після якоря ----------
@@ -354,17 +458,21 @@ LEADERSHIP_MATCH = {
     },
 }
 
+# Загальний, не прив'язаний до конкретної ролі, паттерн — покриває звичайний
+# F/H-обчислений командирський блок («Командир військової частини <будь-який
+# номер>»), коли він записаний СТАТИЧНИМ текстом (не «...»-плейсхолдером і не
+# MERGEFIELD). Спрацьовує тільки якщо dataMap показує, що для ЦІЄЇ людини
+# командир уже замінений на ТВО (значення «Ком пос1» починається з «ТВО »).
+GENERIC_COMMANDER_POS_PATTERN = re.compile(
+    r'Командир\s+військової\s+частини\s+[A-ZА-ЯІЇЄҐ]\s*\d+', re.IGNORECASE
+)
+
 
 def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
 
 
 def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True, touched_ids=None):
-    """touched_ids — ВНУТРІШНІЙ облік (за id XML-елемента абзацу), а НЕ за
-       видимою підсвіткою. Це принципово: шаблон сам по собі може вже мати
-       жовту заливку як авторський стиль (позначення полів для заповнення) —
-       і такий текст МАЄ лишатись доступним для заміни. «Уже оброблено в
-       цьому виклику» рахуємо лише через touched_ids, який ми самі ведемо."""
     if touched_ids is not None and id(paragraph._p) in touched_ids:
         return False
 
@@ -493,97 +601,114 @@ def _initials_of(im):
     return (im[0] + '.') if im else ''
 
 
-def apply_leadership_substitution(doc, leadership_active):
-    if not leadership_active:
-        return None
-
+def apply_leadership_substitution(doc, leadership_active, data_map, touched_ids):
     diag_lines = []
     full_text_norm = None
-    touched_ids = set()  # спільний для ВСІХ ролей у цьому документі
 
-    for role_key, cfg in LEADERSHIP_MATCH.items():
-        override = leadership_active.get(role_key)
-        if not override:
-            continue
-        new_zv = (override.get('zvannia') or '').strip()
-        new_im = (override.get('im') or '').strip()
-        new_fam = (override.get('fam') or '').strip().upper()
+    if leadership_active:
+        for role_key, cfg in LEADERSHIP_MATCH.items():
+            override = leadership_active.get(role_key)
+            if not override:
+                continue
+            new_zv = (override.get('zvannia') or '').strip()
+            new_im = (override.get('im') or '').strip()
+            new_fam = (override.get('fam') or '').strip().upper()
 
-        diag_lines.append(
-            'Отримано ТВО для ролі «' + role_key + '»: звання=«' + new_zv +
-            '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»'
-        )
-
-        if not new_im or not new_fam:
-            diag_lines.append('  -> ПРОПУЩЕНО: не передано ім\'я або прізвище заступника.')
-            continue
-
-        new_name = new_im + ' ' + new_fam
-        new_initials = _initials_of(new_im)
-        any_hit = False
-        rank_combined_hit = False
-
-        if cfg.get('initialsFam'):
-            pat_init_full = re.compile(
-                _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
-                r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
+            diag_lines.append(
+                'Отримано ТВО для ролі «' + role_key + '»: звання=«' + new_zv +
+                '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»'
             )
-            if replace_pattern_everywhere(doc, pat_init_full,
-                    lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.',
-                    touched_ids=touched_ids):
+
+            if not new_im or not new_fam:
+                diag_lines.append('  -> ПРОПУЩЕНО: не передано ім\'я або прізвище заступника.')
+                continue
+
+            new_name = new_im + ' ' + new_fam
+            new_initials = _initials_of(new_im)
+            any_hit = False
+            rank_combined_hit = False
+
+            if cfg.get('initialsFam'):
+                pat_init_full = re.compile(
+                    _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
+                    r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
+                )
+                if replace_pattern_everywhere(doc, pat_init_full,
+                        lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.',
+                        touched_ids=touched_ids):
+                    any_hit = True
+                    rank_combined_hit = True
+
+            pat_full = re.compile(
+                _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']),
+                re.IGNORECASE
+            )
+            if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name, touched_ids=touched_ids):
                 any_hit = True
                 rank_combined_hit = True
 
-        pat_full = re.compile(
-            _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']),
-            re.IGNORECASE
+            pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']), re.IGNORECASE)
+            name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name, touched_ids=touched_ids)
+            if name_replaced:
+                any_hit = True
+
+            if cfg.get('initialsFam'):
+                pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
+                if replace_pattern_everywhere(doc, pat_init_bare,
+                        lambda m: new_fam + ' ' + new_initials + '.', touched_ids=touched_ids):
+                    any_hit = True
+
+            rank_row_hit = False
+            if not rank_combined_hit and name_replaced:
+                old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
+                new_name_pattern = re.compile(_ws(new_im) + r'[\s\u00A0]+' + _ws(new_fam))
+                if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern, touched_ids=touched_ids):
+                    rank_row_hit = True
+                    any_hit = True
+
+            pos_hit = False
+            for prefix in cfg.get('posPrefixes', []):
+                pat_pos = re.compile(_ws(prefix))
+                if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
+                    pos_hit = True
+                    any_hit = True
+
+            if any_hit:
+                rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
+                diag_lines.append(
+                    '  -> ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' + rank_status +
+                    ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') + ').'
+                )
+            else:
+                if full_text_norm is None:
+                    full_text_norm = full_doc_text_lower(doc)
+                std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
+                diag_lines.append(
+                    '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
+                    ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
+                     if std_name_present else
+                     'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
+                )
+
+    # Загальний F/H-командир: якщо dataMap показує «ТВО ...» в позиційному
+    # полі — додаємо «ТВО» і перед статичним «Командир військової частини N»,
+    # хай яка людина за цим стоїть (не обов'язково одна з 3 названих ролей).
+    pos_value = None
+    for key in ('ком пос1', 'ком пос кому1', 'ком', 'ком кому'):
+        for dk, dv in data_map.items():
+            if normalize_name(dk) == key:
+                pos_value = dv
+                break
+        if pos_value:
+            break
+    if pos_value and normalize_for_anchor_(pos_value).startswith('тво '):
+        generic_hit = replace_pattern_everywhere(
+            doc, GENERIC_COMMANDER_POS_PATTERN, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids
         )
-        if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name, touched_ids=touched_ids):
-            any_hit = True
-            rank_combined_hit = True
-
-        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']), re.IGNORECASE)
-        name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name, touched_ids=touched_ids)
-        if name_replaced:
-            any_hit = True
-
-        if cfg.get('initialsFam'):
-            pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
-            if replace_pattern_everywhere(doc, pat_init_bare,
-                    lambda m: new_fam + ' ' + new_initials + '.', touched_ids=touched_ids):
-                any_hit = True
-
-        rank_row_hit = False
-        if not rank_combined_hit and name_replaced:
-            old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
-            new_name_pattern = re.compile(_ws(new_im) + r'[\s\u00A0]+' + _ws(new_fam))
-            if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern, touched_ids=touched_ids):
-                rank_row_hit = True
-                any_hit = True
-
-        pos_hit = False
-        for prefix in cfg.get('posPrefixes', []):
-            pat_pos = re.compile(_ws(prefix))
-            if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
-                pos_hit = True
-                any_hit = True
-
-        if any_hit:
-            rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
-            diag_lines.append(
-                '  -> ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' + rank_status +
-                ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') + ').'
-            )
-        else:
-            if full_text_norm is None:
-                full_text_norm = full_doc_text_lower(doc)
-            std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
-            diag_lines.append(
-                '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
-                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
-                 if std_name_present else
-                 'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
-            )
+        diag_lines.append(
+            'Загальний F/H-командир: dataMap показує заміну на ТВО. Пошук статичного '
+            '«Командир військової частини N» ' + ('ЗНАЙДЕНО і замінено.' if generic_hit else 'нічого не знайшов у цьому файлі.')
+        )
 
     return '\n'.join(diag_lines) if diag_lines else None
 
@@ -617,9 +742,11 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
             age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
                         'для вставки пункту 8 у цьому файлі.')
 
+    # Спершу — «...»-плейсхолдери ТА справжні MERGEFIELD (обидва формати одразу)
     apply_placeholders(doc, data_map)
 
-    leadership_note = apply_leadership_substitution(doc, leadership_active)
+    touched_ids = set()
+    leadership_note = apply_leadership_substitution(doc, leadership_active, data_map, touched_ids)
 
     out = io.BytesIO()
     doc.save(out)
