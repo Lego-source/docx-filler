@@ -13,9 +13,7 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-# ⚠️ ВЕРСІЯ — міняйте це значення при кожному оновленні, щоб миттєво бачити
-# в браузері (відкривши адресу сервісу), чи справді задеплоївся новий код.
-APP_VERSION = "2026-07-23-leadership-v4-rowrank"
+APP_VERSION = "2026-07-23-leadership-v5-order-fix"
 
 
 # ---------- Нормалізація ----------
@@ -361,7 +359,23 @@ def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
 
 
+def paragraph_already_touched(paragraph):
+    """True, якщо в цьому абзаці вже є хоч один жовто-підсвічений ран —
+       тобто його вже обробила ІНША роль у ЦЬОМУ САМОМУ виклику ТВО-керівництва.
+       Це запобігає «каскадному з'їданню»: коли підстановка однієї ролі (напр.
+       Ком.Полку -> Свиридов) щойно вставила текст «Свиридов», і НАСТУПНА роль
+       (Нач.Штабу шукає «Свиридов», щоб замінити на Дуркіна) помилково чіпає
+       саме цей щойно вставлений фрагмент замість справжнього, ще не займаного."""
+    for r in paragraph.runs:
+        if r.text and r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
+            return True
+    return False
+
+
 def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
+    if paragraph_already_touched(paragraph):
+        return False
+
     runs = paragraph.runs
     if not runs:
         return False
@@ -464,6 +478,8 @@ def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
 
             for cell in cells:
                 for p in cell.paragraphs:
+                    if paragraph_already_touched(p):
+                        continue
                     text = ''.join(r.text for r in p.runs)
                     if normalize_for_anchor_(text) == old_rank_norm:
                         runs = p.runs
@@ -521,13 +537,14 @@ def apply_leadership_substitution(doc, leadership_active):
                 rank_combined_hit = True
 
         pat_full = re.compile(
-            _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam'])
+            _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']),
+            re.IGNORECASE
         )
         if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name):
             any_hit = True
             rank_combined_hit = True
 
-        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
+        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']), re.IGNORECASE)
         name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
         if name_replaced:
             any_hit = True
@@ -565,7 +582,7 @@ def apply_leadership_substitution(doc, leadership_active):
             std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
             diag_lines.append(
                 '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
-                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
+                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся (або вже зайняте іншою роллю).'
                  if std_name_present else
                  'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
             )
@@ -602,9 +619,13 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
             age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
                         'для вставки пункту 8 у цьому файлі.')
 
-    leadership_note = apply_leadership_substitution(doc, leadership_active)
-
+    # ⚠️ ВАЖЛИВО: спершу підставляємо плейсхолдери (тоді «ком_ім»/«ком_фам»
+    # тощо перетворюються на реальні ПІБ), і лише ПІСЛЯ цього шукаємо й
+    # заміняємо ТВО-керівництва — інакше на момент пошуку там ще стоїть
+    # нерозв'язаний токен «ком_фам», а не текст «Свиридов», і збігу не буде.
     apply_placeholders(doc, data_map)
+
+    leadership_note = apply_leadership_substitution(doc, leadership_active)
 
     out = io.BytesIO()
     doc.save(out)
@@ -638,8 +659,6 @@ def generate():
 
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # Кладемо версію прямо в архів, щоб бачити її і в результаті формування,
-        # а не тільки при відкритті адреси сервісу в браузері.
         zf.writestr('_ВЕРСІЯ_СЕРВІСУ.txt', ('Версія app.py, що обробила цей запит: ' + APP_VERSION).encode('utf-8'))
 
         for person in job.get('people', []):
