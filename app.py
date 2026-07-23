@@ -13,7 +13,7 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-23-leadership-v5-order-fix"
+APP_VERSION = "2026-07-23-leadership-v6-idtrack"
 
 
 # ---------- Нормалізація ----------
@@ -359,21 +359,13 @@ def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
 
 
-def paragraph_already_touched(paragraph):
-    """True, якщо в цьому абзаці вже є хоч один жовто-підсвічений ран —
-       тобто його вже обробила ІНША роль у ЦЬОМУ САМОМУ виклику ТВО-керівництва.
-       Це запобігає «каскадному з'їданню»: коли підстановка однієї ролі (напр.
-       Ком.Полку -> Свиридов) щойно вставила текст «Свиридов», і НАСТУПНА роль
-       (Нач.Штабу шукає «Свиридов», щоб замінити на Дуркіна) помилково чіпає
-       саме цей щойно вставлений фрагмент замість справжнього, ще не займаного."""
-    for r in paragraph.runs:
-        if r.text and r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
-            return True
-    return False
-
-
-def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
-    if paragraph_already_touched(paragraph):
+def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True, touched_ids=None):
+    """touched_ids — ВНУТРІШНІЙ облік (за id XML-елемента абзацу), а НЕ за
+       видимою підсвіткою. Це принципово: шаблон сам по собі може вже мати
+       жовту заливку як авторський стиль (позначення полів для заповнення) —
+       і такий текст МАЄ лишатись доступним для заміни. «Уже оброблено в
+       цьому виклику» рахуємо лише через touched_ids, який ми самі ведемо."""
+    if touched_ids is not None and id(paragraph._p) in touched_ids:
         return False
 
     runs = paragraph.runs
@@ -433,27 +425,29 @@ def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
                 runs[k].text = ''
             runs[last_i].text = suffix
 
+    if touched_ids is not None:
+        touched_ids.add(id(paragraph._p))
     return True
 
 
-def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True):
+def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True, touched_ids=None):
     changed = False
     for p in collect_paragraphs_dedup(doc):
-        if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight):
+        if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight, touched_ids=touched_ids):
             changed = True
     for container in all_containers(doc):
         if container is doc:
             continue
         try:
             for p in collect_paragraphs_dedup(container):
-                if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight):
+                if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight, touched_ids=touched_ids):
                     changed = True
         except Exception:
             pass
     return changed
 
 
-def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
+def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern, touched_ids=None):
     changed = False
     seen_rows = set()
     tables = walk_all_tables(doc)
@@ -478,7 +472,7 @@ def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
 
             for cell in cells:
                 for p in cell.paragraphs:
-                    if paragraph_already_touched(p):
+                    if touched_ids is not None and id(p._p) in touched_ids:
                         continue
                     text = ''.join(r.text for r in p.runs)
                     if normalize_for_anchor_(text) == old_rank_norm:
@@ -489,6 +483,8 @@ def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
                             for r in runs[1:]:
                                 r.text = ''
                             changed = True
+                            if touched_ids is not None:
+                                touched_ids.add(id(p._p))
     return changed
 
 
@@ -503,6 +499,7 @@ def apply_leadership_substitution(doc, leadership_active):
 
     diag_lines = []
     full_text_norm = None
+    touched_ids = set()  # спільний для ВСІХ ролей у цьому документі
 
     for role_key, cfg in LEADERSHIP_MATCH.items():
         override = leadership_active.get(role_key)
@@ -532,7 +529,8 @@ def apply_leadership_substitution(doc, leadership_active):
                 r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
             )
             if replace_pattern_everywhere(doc, pat_init_full,
-                    lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.'):
+                    lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.',
+                    touched_ids=touched_ids):
                 any_hit = True
                 rank_combined_hit = True
 
@@ -540,33 +538,33 @@ def apply_leadership_substitution(doc, leadership_active):
             _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']),
             re.IGNORECASE
         )
-        if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name):
+        if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name, touched_ids=touched_ids):
             any_hit = True
             rank_combined_hit = True
 
         pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']), re.IGNORECASE)
-        name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
+        name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name, touched_ids=touched_ids)
         if name_replaced:
             any_hit = True
 
         if cfg.get('initialsFam'):
             pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
             if replace_pattern_everywhere(doc, pat_init_bare,
-                    lambda m: new_fam + ' ' + new_initials + '.'):
+                    lambda m: new_fam + ' ' + new_initials + '.', touched_ids=touched_ids):
                 any_hit = True
 
         rank_row_hit = False
         if not rank_combined_hit and name_replaced:
             old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
             new_name_pattern = re.compile(_ws(new_im) + r'[\s\u00A0]+' + _ws(new_fam))
-            if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern):
+            if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern, touched_ids=touched_ids):
                 rank_row_hit = True
                 any_hit = True
 
         pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
-            if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0)):
+            if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
                 pos_hit = True
                 any_hit = True
 
@@ -582,7 +580,7 @@ def apply_leadership_substitution(doc, leadership_active):
             std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
             diag_lines.append(
                 '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
-                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся (або вже зайняте іншою роллю).'
+                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
                  if std_name_present else
                  'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
             )
@@ -619,10 +617,6 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
             age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
                         'для вставки пункту 8 у цьому файлі.')
 
-    # ⚠️ ВАЖЛИВО: спершу підставляємо плейсхолдери (тоді «ком_ім»/«ком_фам»
-    # тощо перетворюються на реальні ПІБ), і лише ПІСЛЯ цього шукаємо й
-    # заміняємо ТВО-керівництва — інакше на момент пошуку там ще стоїть
-    # нерозв'язаний токен «ком_фам», а не текст «Свиридов», і збігу не буде.
     apply_placeholders(doc, data_map)
 
     leadership_note = apply_leadership_substitution(doc, leadership_active)
