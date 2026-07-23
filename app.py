@@ -59,11 +59,9 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Обхід абзаців (з дедублікацією для об'єднаних клітинок) ----------
+# ---------- Обхід абзаців ----------
 
 def collect_paragraphs(container):
-    """Звичайний обхід (для сумісності з існуючими функціями) — може повертати
-       той самий абзац кілька разів, якщо він лежить в об'єднаній клітинці."""
     paras = []
     try:
         paras.extend(container.paragraphs)
@@ -80,10 +78,6 @@ def collect_paragraphs(container):
 
 
 def collect_paragraphs_dedup(container):
-    """Той самий обхід, але БЕЗ дублікатів фізичних абзаців — важливо для
-       об'єднаних клітинок (gridSpan), де python-docx повертає той самий
-       <w:p> кілька разів. Використовується для операцій, що застосовуються
-       до ВСІХ збігів (а не лише до першого)."""
     paras = []
     seen = set()
 
@@ -118,6 +112,23 @@ def all_containers(doc):
         containers.append(section.first_page_footer)
         containers.append(section.even_page_footer)
     return containers
+
+
+def full_doc_text_lower(doc):
+    """Весь видимий текст документа (тіло+таблиці+колонтитули), одним рядком,
+       для діагностики (чи взагалі є така фраза в цьому файлі)."""
+    parts = []
+    for p in collect_paragraphs_dedup(doc):
+        parts.append(''.join(r.text for r in p.runs))
+    for container in all_containers(doc):
+        if container is doc:
+            continue
+        try:
+            for p in collect_paragraphs_dedup(container):
+                parts.append(''.join(r.text for r in p.runs))
+        except Exception:
+            pass
+    return normalize_for_anchor_(' '.join(parts))
 
 
 # ---------- Заміна плейсхолдерів «...» ----------
@@ -186,7 +197,7 @@ def apply_placeholders(doc, data_map):
                 pass
 
 
-# ---------- Вставка нового абзацу після якоря (спільна допоміжна) ----------
+# ---------- Вставка нового абзацу після якоря ----------
 
 def insert_paragraph_after(anchor_paragraph, text):
     new_p = copy.deepcopy(anchor_paragraph._p)
@@ -328,19 +339,10 @@ LEADERSHIP_MATCH = {
 
 
 def _ws(s):
-    """Гнучкий пробіл для regex: довільна кількість пробілів/табів/невидимих пробілів."""
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
 
 
 def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
-    """Безпечна заміна за довільним regex у межах ОДНОГО абзаца:
-       - усі збіги знаходяться ОДНИМ проходом у незміненому тексті;
-       - застосовуються СПРАВА НАЛІВО, щоб офсети лівіших (ще не оброблених)
-         збігів лишались коректними;
-       - текст ДО і ПІСЛЯ збігу не чіпається (окремі рани, без підсвітки);
-       - замінений/вставлений фрагмент кладеться в окремий новий ран
-         із жовтою підсвіткою (за potребою).
-       Повертає True, якщо абзац змінено."""
     runs = paragraph.runs
     if not runs:
         return False
@@ -402,18 +404,20 @@ def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
 
 
 def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True):
-    """Застосовує regex-заміну по ВСЬОМУ документу (тіло + таблиці + колонтитули),
-       з дедублікацією абзаців з об'єднаних клітинок."""
+    changed = False
     for p in collect_paragraphs_dedup(doc):
-        regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight)
+        if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight):
+            changed = True
     for container in all_containers(doc):
         if container is doc:
             continue
         try:
             for p in collect_paragraphs_dedup(container):
-                regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight)
+                if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight):
+                    changed = True
         except Exception:
             pass
+    return changed
 
 
 def _initials_of(im):
@@ -422,11 +426,13 @@ def _initials_of(im):
 
 
 def apply_leadership_substitution(doc, leadership_active):
-    """leadership_active: dict {roleKey: {'zvannia','im','fam'} or falsy}.
-       Підміняє і "звання+ПІБ" (у кількох варіантах написання), і сам текст
-       посади (додає префікс «ТВО » перед стабільним початком фрази)."""
+    """Повертає ДІАГНОСТИЧНИЙ рядок (або None, якщо все ок / нічого не передано)."""
     if not leadership_active:
-        return
+        return None
+
+    diag_lines = []
+    full_text_norm = None  # рахуємо лише за потреби, лениво
+
     for role_key, cfg in LEADERSHIP_MATCH.items():
         override = leadership_active.get(role_key)
         if not override:
@@ -434,42 +440,68 @@ def apply_leadership_substitution(doc, leadership_active):
         new_zv = (override.get('zvannia') or '').strip()
         new_im = (override.get('im') or '').strip()
         new_fam = (override.get('fam') or '').strip().upper()
+
+        diag_lines.append(
+            'Отримано ТВО для ролі «' + role_key + '»: звання=«' + new_zv +
+            '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»'
+        )
+
         if not new_im or not new_fam:
+            diag_lines.append('  -> ПРОПУЩЕНО: не передано ім\'я або прізвище заступника.')
             continue
+
         new_name = new_im + ' ' + new_fam
         new_initials = _initials_of(new_im)
+        any_hit = False
 
-        # 1) "звання + ПРІЗВИЩЕ Ім'я.Побатькові." (ініціали) — НАЙБІЛЬШ специфічний,
-        #    пробуємо ПЕРШИМ, щоб і звання теж оновилось у цьому форматі запису.
         if cfg.get('initialsFam'):
             pat_init_full = re.compile(
                 _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
                 r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
             )
-            replace_pattern_everywhere(
-                doc, pat_init_full,
-                lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.'
-            )
+            if replace_pattern_everywhere(doc, pat_init_full,
+                    lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.'):
+                any_hit = True
 
-        # 2) "звання + ім'я ПРІЗВИЩЕ" разом (основний, найчастіший випадок)
         pat_full = re.compile(
             _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam'])
         )
-        replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name)
+        if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name):
+            any_hit = True
 
-        # 3) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (запасний варіант)
         pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
-        replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
+        if replace_pattern_everywhere(doc, pat_name, lambda m: new_name):
+            any_hit = True
 
-        # 4) Голе "ПРІЗВИЩЕ І.П." без звання поруч (запасний варіант ініціалів)
         if cfg.get('initialsFam'):
             pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
-            replace_pattern_everywhere(doc, pat_init_bare, lambda m: new_fam + ' ' + new_initials + '.')
+            if replace_pattern_everywhere(doc, pat_init_bare,
+                    lambda m: new_fam + ' ' + new_initials + '.'):
+                any_hit = True
 
-        # 5) Текст ПОСАДИ — додаємо «ТВО » перед стабільним початком фрази.
+        pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
-            replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0))
+            if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0)):
+                pos_hit = True
+                any_hit = True
+
+        if any_hit:
+            diag_lines.append('  -> ЗНАЙДЕНО і замінено (звання/ПІБ: так' +
+                               (', посада: так' if pos_hit else ', посада: НІ — якір посади не знайдено') + ').')
+        else:
+            # перевіряємо, чи стандартне ім'я взагалі є в документі
+            if full_text_norm is None:
+                full_text_norm = full_doc_text_lower(doc)
+            std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
+            diag_lines.append(
+                '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
+                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн (звання+ім\'я, голе ім\'я, ініціали, посада) не збігся — можливо, інший запис/форматування.'
+                 if std_name_present else
+                 'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
+            )
+
+    return '\n'.join(diag_lines) if diag_lines else None
 
 
 # ---------- Заповнення одного документа ----------
@@ -501,19 +533,15 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
             age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
                         'для вставки пункту 8 у цьому файлі.')
 
-    # ТВО-керівництва — пряма текстова заміна, до підстановки плейсхолдерів
-    apply_leadership_substitution(doc, leadership_active)
+    leadership_note = apply_leadership_substitution(doc, leadership_active)
 
     apply_placeholders(doc, data_map)
 
     out = io.BytesIO()
     doc.save(out)
 
-    note = None
-    if tvo_note and age_note:
-        note = tvo_note + '\n' + age_note
-    else:
-        note = tvo_note or age_note
+    notes = [n for n in (tvo_note, age_note, leadership_note) if n]
+    note = '\n'.join(notes) if notes else None
 
     return out.getvalue(), note
 
