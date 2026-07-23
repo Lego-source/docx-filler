@@ -13,6 +13,10 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
+# ⚠️ ВЕРСІЯ — міняйте це значення при кожному оновленні, щоб миттєво бачити
+# в браузері (відкривши адресу сервісу), чи справді задеплоївся новий код.
+APP_VERSION = "2026-07-23-leadership-v4-rowrank"
+
 
 # ---------- Нормалізація ----------
 
@@ -103,7 +107,6 @@ def collect_paragraphs_dedup(container):
 
 
 def walk_all_tables(container):
-    """Рекурсивно повертає всі таблиці, включно з вкладеними в клітинки."""
     tables = []
     try:
         for t in container.tables:
@@ -437,11 +440,6 @@ def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True):
 
 
 def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
-    """Якщо в рядку таблиці є клітинка зі збігом ІМЕНІ (вже замінене на нове),
-       і в ТОМУ Ж рядку є клітинка, ЦІЛИЙ текст якої (після нормалізації)
-       дорівнює старому званню — підмінюємо звання ЛИШЕ в цій клітинці.
-       Це безпечно масштабовано на конкретний рядок і не займає інших людей
-       з таким самим званням деінде в документі."""
     changed = False
     seen_rows = set()
     tables = walk_all_tables(doc)
@@ -484,7 +482,6 @@ def _initials_of(im):
 
 
 def apply_leadership_substitution(doc, leadership_active):
-    """Повертає діагностичний рядок (або None)."""
     if not leadership_active:
         return None
 
@@ -513,7 +510,6 @@ def apply_leadership_substitution(doc, leadership_active):
         any_hit = False
         rank_combined_hit = False
 
-        # 1) "звання + ПРІЗВИЩЕ І.П." (ініціали, разом)
         if cfg.get('initialsFam'):
             pat_init_full = re.compile(
                 _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
@@ -524,7 +520,6 @@ def apply_leadership_substitution(doc, leadership_active):
                 any_hit = True
                 rank_combined_hit = True
 
-        # 2) "звання + ім'я ПРІЗВИЩЕ" разом (в ОДНОМУ абзаці)
         pat_full = re.compile(
             _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam'])
         )
@@ -532,23 +527,17 @@ def apply_leadership_substitution(doc, leadership_active):
             any_hit = True
             rank_combined_hit = True
 
-        # 3) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (найчастіший випадок —
-        #    звання і ПІБ лежать у РІЗНИХ клітинках однієї таблиці)
         pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
         name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
         if name_replaced:
             any_hit = True
 
-        # 4) Голе "ПРІЗВИЩЕ І.П." без звання поруч
         if cfg.get('initialsFam'):
             pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
             if replace_pattern_everywhere(doc, pat_init_bare,
                     lambda m: new_fam + ' ' + new_initials + '.'):
                 any_hit = True
 
-        # 5) Якщо звання ще НЕ підмінено разом з ім'ям (випадок 2/1 не спрацював),
-        #    і ім'я ВЖЕ замінено окремо — шукаємо звання в ТОМУ Ж РЯДКУ таблиці,
-        #    де щойно з'явилось нове ім'я, і підміняємо ЛИШЕ там.
         rank_row_hit = False
         if not rank_combined_hit and name_replaced:
             old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
@@ -557,7 +546,6 @@ def apply_leadership_substitution(doc, leadership_active):
                 rank_row_hit = True
                 any_hit = True
 
-        # 6) Текст ПОСАДИ — додаємо «ТВО » перед стабільним початком фрази.
         pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
@@ -631,12 +619,12 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
 
 @app.route('/', methods=['GET'])
 def root():
-    return 'DOCX filler service is running.', 200
+    return 'DOCX filler service is running. VERSION: ' + APP_VERSION, 200
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return 'ok', 200
+    return 'ok | VERSION: ' + APP_VERSION, 200
 
 
 @app.route('/generate', methods=['POST'])
@@ -650,6 +638,10 @@ def generate():
 
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Кладемо версію прямо в архів, щоб бачити її і в результаті формування,
+        # а не тільки при відкритті адреси сервісу в браузері.
+        zf.writestr('_ВЕРСІЯ_СЕРВІСУ.txt', ('Версія app.py, що обробила цей запит: ' + APP_VERSION).encode('utf-8'))
+
         for person in job.get('people', []):
             folder = person.get('folder', '') or ''
             data_map = person.get('data', {}) or {}
