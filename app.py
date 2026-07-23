@@ -102,6 +102,24 @@ def collect_paragraphs_dedup(container):
     return paras
 
 
+def walk_all_tables(container):
+    """Рекурсивно повертає всі таблиці, включно з вкладеними в клітинки."""
+    tables = []
+    try:
+        for t in container.tables:
+            tables.append(t)
+            for row in t.rows:
+                for cell in row.cells:
+                    tables.extend(walk_all_tables(cell))
+    except Exception:
+        pass
+    return tables
+
+
+def cell_plain_text(cell):
+    return ' '.join(''.join(r.text for r in p.runs) for p in cell.paragraphs)
+
+
 def all_containers(doc):
     containers = [doc]
     for section in doc.sections:
@@ -115,8 +133,6 @@ def all_containers(doc):
 
 
 def full_doc_text_lower(doc):
-    """Весь видимий текст документа (тіло+таблиці+колонтитули), одним рядком,
-       для діагностики (чи взагалі є така фраза в цьому файлі)."""
     parts = []
     for p in collect_paragraphs_dedup(doc):
         parts.append(''.join(r.text for r in p.runs))
@@ -420,18 +436,60 @@ def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True):
     return changed
 
 
+def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern):
+    """Якщо в рядку таблиці є клітинка зі збігом ІМЕНІ (вже замінене на нове),
+       і в ТОМУ Ж рядку є клітинка, ЦІЛИЙ текст якої (після нормалізації)
+       дорівнює старому званню — підмінюємо звання ЛИШЕ в цій клітинці.
+       Це безпечно масштабовано на конкретний рядок і не займає інших людей
+       з таким самим званням деінде в документі."""
+    changed = False
+    seen_rows = set()
+    tables = walk_all_tables(doc)
+    for table in tables:
+        for row in table.rows:
+            row_id = id(row._tr)
+            if row_id in seen_rows:
+                continue
+            seen_cells = set()
+            cells = []
+            for cell in row.cells:
+                tcid = id(cell._tc)
+                if tcid in seen_cells:
+                    continue
+                seen_cells.add(tcid)
+                cells.append(cell)
+
+            name_hit = any(name_pattern.search(cell_plain_text(c)) for c in cells)
+            if not name_hit:
+                continue
+            seen_rows.add(row_id)
+
+            for cell in cells:
+                for p in cell.paragraphs:
+                    text = ''.join(r.text for r in p.runs)
+                    if normalize_for_anchor_(text) == old_rank_norm:
+                        runs = p.runs
+                        if runs:
+                            runs[0].text = new_rank
+                            runs[0].font.highlight_color = WD_COLOR_INDEX.YELLOW
+                            for r in runs[1:]:
+                                r.text = ''
+                            changed = True
+    return changed
+
+
 def _initials_of(im):
     im = (im or '').strip()
     return (im[0] + '.') if im else ''
 
 
 def apply_leadership_substitution(doc, leadership_active):
-    """Повертає ДІАГНОСТИЧНИЙ рядок (або None, якщо все ок / нічого не передано)."""
+    """Повертає діагностичний рядок (або None)."""
     if not leadership_active:
         return None
 
     diag_lines = []
-    full_text_norm = None  # рахуємо лише за потреби, лениво
+    full_text_norm = None
 
     for role_key, cfg in LEADERSHIP_MATCH.items():
         override = leadership_active.get(role_key)
@@ -453,7 +511,9 @@ def apply_leadership_substitution(doc, leadership_active):
         new_name = new_im + ' ' + new_fam
         new_initials = _initials_of(new_im)
         any_hit = False
+        rank_combined_hit = False
 
+        # 1) "звання + ПРІЗВИЩЕ І.П." (ініціали, разом)
         if cfg.get('initialsFam'):
             pat_init_full = re.compile(
                 _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
@@ -462,23 +522,42 @@ def apply_leadership_substitution(doc, leadership_active):
             if replace_pattern_everywhere(doc, pat_init_full,
                     lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.'):
                 any_hit = True
+                rank_combined_hit = True
 
+        # 2) "звання + ім'я ПРІЗВИЩЕ" разом (в ОДНОМУ абзаці)
         pat_full = re.compile(
             _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam'])
         )
         if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name):
             any_hit = True
+            rank_combined_hit = True
 
+        # 3) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (найчастіший випадок —
+        #    звання і ПІБ лежать у РІЗНИХ клітинках однієї таблиці)
         pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
-        if replace_pattern_everywhere(doc, pat_name, lambda m: new_name):
+        name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
+        if name_replaced:
             any_hit = True
 
+        # 4) Голе "ПРІЗВИЩЕ І.П." без звання поруч
         if cfg.get('initialsFam'):
             pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
             if replace_pattern_everywhere(doc, pat_init_bare,
                     lambda m: new_fam + ' ' + new_initials + '.'):
                 any_hit = True
 
+        # 5) Якщо звання ще НЕ підмінено разом з ім'ям (випадок 2/1 не спрацював),
+        #    і ім'я ВЖЕ замінено окремо — шукаємо звання в ТОМУ Ж РЯДКУ таблиці,
+        #    де щойно з'явилось нове ім'я, і підміняємо ЛИШЕ там.
+        rank_row_hit = False
+        if not rank_combined_hit and name_replaced:
+            old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
+            new_name_pattern = re.compile(_ws(new_im) + r'[\s\u00A0]+' + _ws(new_fam))
+            if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern):
+                rank_row_hit = True
+                any_hit = True
+
+        # 6) Текст ПОСАДИ — додаємо «ТВО » перед стабільним початком фрази.
         pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
@@ -487,16 +566,18 @@ def apply_leadership_substitution(doc, leadership_active):
                 any_hit = True
 
         if any_hit:
-            diag_lines.append('  -> ЗНАЙДЕНО і замінено (звання/ПІБ: так' +
-                               (', посада: так' if pos_hit else ', посада: НІ — якір посади не знайдено') + ').')
+            rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
+            diag_lines.append(
+                '  -> ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' + rank_status +
+                ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') + ').'
+            )
         else:
-            # перевіряємо, чи стандартне ім'я взагалі є в документі
             if full_text_norm is None:
                 full_text_norm = full_doc_text_lower(doc)
             std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
             diag_lines.append(
                 '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
-                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн (звання+ім\'я, голе ім\'я, ініціали, посада) не збігся — можливо, інший запис/форматування.'
+                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
                  if std_name_present else
                  'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
             )
