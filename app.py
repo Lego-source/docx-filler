@@ -7,6 +7,8 @@ from flask import Flask, request, Response
 
 from docx import Document
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
+from docx.enum.text import WD_COLOR_INDEX
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
@@ -57,7 +59,68 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Заміна в абзаці (плейсхолдери) ----------
+# ---------- Обхід абзаців (з дедублікацією для об'єднаних клітинок) ----------
+
+def collect_paragraphs(container):
+    """Звичайний обхід (для сумісності з існуючими функціями) — може повертати
+       той самий абзац кілька разів, якщо він лежить в об'єднаній клітинці."""
+    paras = []
+    try:
+        paras.extend(container.paragraphs)
+    except Exception:
+        pass
+    try:
+        for table in container.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    paras.extend(collect_paragraphs(cell))
+    except Exception:
+        pass
+    return paras
+
+
+def collect_paragraphs_dedup(container):
+    """Той самий обхід, але БЕЗ дублікатів фізичних абзаців — важливо для
+       об'єднаних клітинок (gridSpan), де python-docx повертає той самий
+       <w:p> кілька разів. Використовується для операцій, що застосовуються
+       до ВСІХ збігів (а не лише до першого)."""
+    paras = []
+    seen = set()
+
+    def _walk(c):
+        try:
+            for p in c.paragraphs:
+                pid = id(p._p)
+                if pid not in seen:
+                    seen.add(pid)
+                    paras.append(p)
+        except Exception:
+            pass
+        try:
+            for table in c.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        _walk(cell)
+        except Exception:
+            pass
+
+    _walk(container)
+    return paras
+
+
+def all_containers(doc):
+    containers = [doc]
+    for section in doc.sections:
+        containers.append(section.header)
+        containers.append(section.first_page_header)
+        containers.append(section.even_page_header)
+        containers.append(section.footer)
+        containers.append(section.first_page_footer)
+        containers.append(section.even_page_footer)
+    return containers
+
+
+# ---------- Заміна плейсхолдерів «...» ----------
 
 def replace_in_paragraph(paragraph, pattern, lookup):
     runs = paragraph.runs
@@ -105,22 +168,6 @@ def replace_in_paragraph(paragraph, pattern, lookup):
             for k in range(first_i + 1, last_i):
                 runs[k].text = ''
             runs[last_i].text = suffix
-
-
-def collect_paragraphs(container):
-    paras = []
-    try:
-        paras.extend(container.paragraphs)
-    except Exception:
-        pass
-    try:
-        for table in container.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    paras.extend(collect_paragraphs(cell))
-    except Exception:
-        pass
-    return paras
 
 
 def apply_placeholders(doc, data_map):
@@ -248,9 +295,12 @@ AGE_CLAUSE_TEXT = (
 
 
 def insert_age_clause(doc):
-    """Шукає абзац з характерним словом «сп'яніння» (включно з таблицями)
-       і дописує після нього додаткове речення. True — якщо вставлено."""
+    seen_ids = set()
     for p in collect_paragraphs(doc):
+        pid = id(p._p)
+        if pid in seen_ids:
+            continue
+        seen_ids.add(pid)
         text = normalize_for_anchor_(''.join(r.text for r in p.runs))
         if AGE_CLAUSE_ANCHOR_NORM in text:
             insert_paragraph_after(p, AGE_CLAUSE_TEXT)
@@ -258,13 +308,22 @@ def insert_age_clause(doc):
     return False
 
 
-# ---------- ТВО-керівництва (пряма текстова заміна, не плейсхолдери) ----------
+# ---------- ТВО-керівництва (пряма текстова заміна з підсвіткою) ----------
 
 LEADERSHIP_MATCH = {
-    'komPolku':   {'zvannia': 'майор', 'im': 'Максим', 'fam': 'ЗАЙЧЕНКО'},
-    'nachShtabu': {'zvannia': 'старший лейтенант', 'im': 'Євген', 'fam': 'СВИРИДОВ',
-                   'initialsFam': 'СВИРИДОВ'},
-    'komKorpusu': {'zvannia': 'бригадний генерал', 'im': 'Андрій', 'fam': 'БІЛЕЦЬКИЙ'},
+    'komPolku': {
+        'zvannia': 'майор', 'im': 'Максим', 'fam': 'ЗАЙЧЕНКО',
+        'posPrefixes': ['Командир 1030'],
+    },
+    'nachShtabu': {
+        'zvannia': 'старший лейтенант', 'im': 'Євген', 'fam': 'СВИРИДОВ',
+        'initialsFam': 'СВИРИДОВ',
+        'posPrefixes': ['Начальник штабу'],
+    },
+    'komKorpusu': {
+        'zvannia': 'бригадний генерал', 'im': 'Андрій', 'fam': 'БІЛЕЦЬКИЙ',
+        'posPrefixes': ['Командир 3 армійського', 'Командир військової частини А5111'],
+    },
 }
 
 
@@ -273,44 +332,99 @@ def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
 
 
-def _initials_of(im, fam):
+def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True):
+    """Безпечна заміна за довільним regex у межах ОДНОГО абзаца:
+       - усі збіги знаходяться ОДНИМ проходом у незміненому тексті;
+       - застосовуються СПРАВА НАЛІВО, щоб офсети лівіших (ще не оброблених)
+         збігів лишались коректними;
+       - текст ДО і ПІСЛЯ збігу не чіпається (окремі рани, без підсвітки);
+       - замінений/вставлений фрагмент кладеться в окремий новий ран
+         із жовтою підсвіткою (за potребою).
+       Повертає True, якщо абзац змінено."""
+    runs = paragraph.runs
+    if not runs:
+        return False
+    full = ''.join(r.text for r in runs)
+    matches = list(pattern.finditer(full))
+    if not matches:
+        return False
+
+    for m in reversed(matches):
+        runs = paragraph.runs
+        texts = [r.text for r in runs]
+        offsets = []
+        pos = 0
+        for t in texts:
+            offsets.append(pos)
+            pos += len(t)
+
+        s, e = m.start(), m.end()
+        value = repl_func(m)
+
+        first_i = None
+        for i in range(len(texts)):
+            if offsets[i] <= s < offsets[i] + len(texts[i]):
+                first_i = i
+                break
+        last_i = None
+        for j in range(len(texts)):
+            if offsets[j] < e <= offsets[j] + len(texts[j]):
+                last_i = j
+        if first_i is None:
+            continue
+        if last_i is None:
+            last_i = len(texts) - 1
+
+        prefix = texts[first_i][:s - offsets[first_i]]
+        suffix = texts[last_i][e - offsets[last_i]:]
+
+        base_run = runs[first_i]
+        base_run.text = prefix
+
+        new_r_elem = copy.deepcopy(base_run._r)
+        base_run._r.addnext(new_r_elem)
+        new_run = Run(new_r_elem, paragraph)
+        new_run.text = value
+        if highlight:
+            new_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+        if first_i == last_i:
+            suf_elem = copy.deepcopy(base_run._r)
+            new_r_elem.addnext(suf_elem)
+            suf_run = Run(suf_elem, paragraph)
+            suf_run.text = suffix
+        else:
+            for k in range(first_i + 1, last_i):
+                runs[k].text = ''
+            runs[last_i].text = suffix
+
+    return True
+
+
+def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True):
+    """Застосовує regex-заміну по ВСЬОМУ документу (тіло + таблиці + колонтитули),
+       з дедублікацією абзаців з об'єднаних клітинок."""
+    for p in collect_paragraphs_dedup(doc):
+        regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight)
+    for container in all_containers(doc):
+        if container is doc:
+            continue
+        try:
+            for p in collect_paragraphs_dedup(container):
+                regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight)
+        except Exception:
+            pass
+
+
+def _initials_of(im):
     im = (im or '').strip()
     return (im[0] + '.') if im else ''
 
 
-def replace_in_all_paragraphs(doc, pattern, repl_func):
-    changed = False
-    for p in collect_paragraphs(doc):
-        full = ''.join(r.text for r in p.runs)
-        new_full, n = pattern.subn(repl_func, full)
-        if n > 0:
-            runs = p.runs
-            if runs:
-                runs[0].text = new_full
-                for r in runs[1:]:
-                    r.text = ''
-            changed = True
-    for section in doc.sections:
-        for hf in (section.header, section.first_page_header, section.even_page_header,
-                   section.footer, section.first_page_footer, section.even_page_footer):
-            try:
-                for p in collect_paragraphs(hf):
-                    full = ''.join(r.text for r in p.runs)
-                    new_full, n = pattern.subn(repl_func, full)
-                    if n > 0:
-                        runs = p.runs
-                        if runs:
-                            runs[0].text = new_full
-                            for r in runs[1:]:
-                                r.text = ''
-                        changed = True
-            except Exception:
-                pass
-    return changed
-
-
 def apply_leadership_substitution(doc, leadership_active):
-    """leadership_active: dict {roleKey: {'zvannia','im','fam'} or falsy}"""
+    """leadership_active: dict {roleKey: {'zvannia','im','fam'} or falsy}.
+       Підміняє і "звання+ПІБ" (у кількох варіантах написання), і сам текст
+       посади (додає префікс «ТВО » перед стабільним початком фрази)."""
     if not leadership_active:
         return
     for role_key, cfg in LEADERSHIP_MATCH.items():
@@ -323,20 +437,39 @@ def apply_leadership_substitution(doc, leadership_active):
         if not new_im or not new_fam:
             continue
         new_name = new_im + ' ' + new_fam
+        new_initials = _initials_of(new_im)
 
-        # 1) "звання + ім'я ПРІЗВИЩЕ" разом (найбезпечніший, специфічний патерн)
-        pat_full = re.compile(_ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
-        replace_in_all_paragraphs(doc, pat_full, lambda m: new_zv + ' ' + new_name)
-
-        # 2) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (запасний варіант)
-        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
-        replace_in_all_paragraphs(doc, pat_name, lambda m: new_name)
-
-        # 3) Варіант "ПРІЗВИЩЕ І.П." (ініціали) — тільки де є в шаблоні (Свиридов)
+        # 1) "звання + ПРІЗВИЩЕ Ім'я.Побатькові." (ініціали) — НАЙБІЛЬШ специфічний,
+        #    пробуємо ПЕРШИМ, щоб і звання теж оновилось у цьому форматі запису.
         if cfg.get('initialsFam'):
-            new_initials = _initials_of(new_im, new_fam)
-            pat_init = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
-            replace_in_all_paragraphs(doc, pat_init, lambda m: new_fam + ' ' + new_initials)
+            pat_init_full = re.compile(
+                _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
+                r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
+            )
+            replace_pattern_everywhere(
+                doc, pat_init_full,
+                lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.'
+            )
+
+        # 2) "звання + ім'я ПРІЗВИЩЕ" разом (основний, найчастіший випадок)
+        pat_full = re.compile(
+            _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam'])
+        )
+        replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name)
+
+        # 3) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (запасний варіант)
+        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
+        replace_pattern_everywhere(doc, pat_name, lambda m: new_name)
+
+        # 4) Голе "ПРІЗВИЩЕ І.П." без звання поруч (запасний варіант ініціалів)
+        if cfg.get('initialsFam'):
+            pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
+            replace_pattern_everywhere(doc, pat_init_bare, lambda m: new_fam + ' ' + new_initials + '.')
+
+        # 5) Текст ПОСАДИ — додаємо «ТВО » перед стабільним початком фрази.
+        for prefix in cfg.get('posPrefixes', []):
+            pat_pos = re.compile(_ws(prefix))
+            replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0))
 
 
 # ---------- Заповнення одного документа ----------
