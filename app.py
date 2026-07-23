@@ -25,8 +25,6 @@ def normalize_apostrophes_(s):
     return (s or '').replace('\u2019', "'").replace('\u02bc', "'")
 
 
-# Максимально «толерантна» нормалізація для пошуку якорів:
-# прибирає будь-які варіанти апострофа й схлопує пробіли/невидимі пробіли.
 def normalize_for_anchor_(s):
     s = (s or '').lower()
     s = s.replace('\u00A0', ' ')
@@ -59,7 +57,7 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Заміна в абзаці ----------
+# ---------- Заміна в абзаці (плейсхолдери) ----------
 
 def replace_in_paragraph(paragraph, pattern, lookup):
     runs = paragraph.runs
@@ -157,7 +155,7 @@ def insert_paragraph_after(anchor_paragraph, text):
     return new_para
 
 
-# ---------- ТВО-вставка (без змін) ----------
+# ---------- ТВО-вставка (блок "Прошу покласти тимчасове виконання...") ----------
 
 TVO_A_MARK   = 'прошу покласти тимчасове виконання'
 TVO_B_START  = 'не заперечую'
@@ -240,8 +238,6 @@ def insert_tvo_block(target_doc, donor_doc):
 
 # ---------- Пункт 8 контракту для військовослужбовців 45+ ----------
 
-# Короткий, стійкий якір: одне характерне слово, без апострофа (порівнюємо
-# після видалення будь-яких варіантів апострофа з обох боків).
 AGE_CLAUSE_ANCHOR_NORM = 'спяніння'
 
 AGE_CLAUSE_TEXT = (
@@ -252,7 +248,7 @@ AGE_CLAUSE_TEXT = (
 
 
 def insert_age_clause(doc):
-    """Шукає абзац з характерним словом «сп'яніння» (включно з таблицями!)
+    """Шукає абзац з характерним словом «сп'яніння» (включно з таблицями)
        і дописує після нього додаткове речення. True — якщо вставлено."""
     for p in collect_paragraphs(doc):
         text = normalize_for_anchor_(''.join(r.text for r in p.runs))
@@ -262,10 +258,92 @@ def insert_age_clause(doc):
     return False
 
 
+# ---------- ТВО-керівництва (пряма текстова заміна, не плейсхолдери) ----------
+
+LEADERSHIP_MATCH = {
+    'komPolku':   {'zvannia': 'майор', 'im': 'Максим', 'fam': 'ЗАЙЧЕНКО'},
+    'nachShtabu': {'zvannia': 'старший лейтенант', 'im': 'Євген', 'fam': 'СВИРИДОВ',
+                   'initialsFam': 'СВИРИДОВ'},
+    'komKorpusu': {'zvannia': 'бригадний генерал', 'im': 'Андрій', 'fam': 'БІЛЕЦЬКИЙ'},
+}
+
+
+def _ws(s):
+    """Гнучкий пробіл для regex: довільна кількість пробілів/табів/невидимих пробілів."""
+    return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
+
+
+def _initials_of(im, fam):
+    im = (im or '').strip()
+    return (im[0] + '.') if im else ''
+
+
+def replace_in_all_paragraphs(doc, pattern, repl_func):
+    changed = False
+    for p in collect_paragraphs(doc):
+        full = ''.join(r.text for r in p.runs)
+        new_full, n = pattern.subn(repl_func, full)
+        if n > 0:
+            runs = p.runs
+            if runs:
+                runs[0].text = new_full
+                for r in runs[1:]:
+                    r.text = ''
+            changed = True
+    for section in doc.sections:
+        for hf in (section.header, section.first_page_header, section.even_page_header,
+                   section.footer, section.first_page_footer, section.even_page_footer):
+            try:
+                for p in collect_paragraphs(hf):
+                    full = ''.join(r.text for r in p.runs)
+                    new_full, n = pattern.subn(repl_func, full)
+                    if n > 0:
+                        runs = p.runs
+                        if runs:
+                            runs[0].text = new_full
+                            for r in runs[1:]:
+                                r.text = ''
+                        changed = True
+            except Exception:
+                pass
+    return changed
+
+
+def apply_leadership_substitution(doc, leadership_active):
+    """leadership_active: dict {roleKey: {'zvannia','im','fam'} or falsy}"""
+    if not leadership_active:
+        return
+    for role_key, cfg in LEADERSHIP_MATCH.items():
+        override = leadership_active.get(role_key)
+        if not override:
+            continue
+        new_zv = (override.get('zvannia') or '').strip()
+        new_im = (override.get('im') or '').strip()
+        new_fam = (override.get('fam') or '').strip().upper()
+        if not new_im or not new_fam:
+            continue
+        new_name = new_im + ' ' + new_fam
+
+        # 1) "звання + ім'я ПРІЗВИЩЕ" разом (найбезпечніший, специфічний патерн)
+        pat_full = re.compile(_ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
+        replace_in_all_paragraphs(doc, pat_full, lambda m: new_zv + ' ' + new_name)
+
+        # 2) Голе "Ім'я ПРІЗВИЩЕ" без звання поруч (запасний варіант)
+        pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']))
+        replace_in_all_paragraphs(doc, pat_name, lambda m: new_name)
+
+        # 3) Варіант "ПРІЗВИЩЕ І.П." (ініціали) — тільки де є в шаблоні (Свиридов)
+        if cfg.get('initialsFam'):
+            new_initials = _initials_of(new_im, new_fam)
+            pat_init = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
+            replace_in_all_paragraphs(doc, pat_init, lambda m: new_fam + ' ' + new_initials)
+
+
 # ---------- Заповнення одного документа ----------
 
 def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
-                  add_age_clause=False, warn_if_age_clause_missing=False):
+                  add_age_clause=False, warn_if_age_clause_missing=False,
+                  leadership_active=None):
     doc = Document(io.BytesIO(docx_bytes))
 
     tvo_note = None
@@ -287,10 +365,11 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
     if add_age_clause:
         found = insert_age_clause(doc)
         if not found and warn_if_age_clause_missing:
-            # Повідомляємо тільки для файлу, який схожий на сам контракт
-            # (щоб не засмічувати архів попередженнями по всіх інших документах).
             age_note = ('Вік 45+: не знайдено абзац зі словом «сп\'яніння» '
                         'для вставки пункту 8 у цьому файлі.')
+
+    # ТВО-керівництва — пряма текстова заміна, до підстановки плейсхолдерів
+    apply_leadership_substitution(doc, leadership_active)
 
     apply_placeholders(doc, data_map)
 
@@ -334,6 +413,7 @@ def generate():
             data_map = person.get('data', {}) or {}
             add_tvo = bool(person.get('addTvo', False))
             add_age_clause = bool(person.get('addAgeClause', False))
+            leadership_active = person.get('leadershipActive') or {}
             tvo_donor_b64 = person.get('tvoDonorB64')
             tvo_donor_bytes = base64.b64decode(tvo_donor_b64) if tvo_donor_b64 else None
 
@@ -341,8 +421,6 @@ def generate():
                 out_name = f.get('outName', 'file.docx')
                 b64 = f.get('templateB64', '')
                 file_add_tvo = add_tvo and bool(f.get('allowTvo', True))
-                # Попередження про відсутній пункт 8 показуємо лише для файлу,
-                # у назві якого є слово "контракт" — саме він мав би містити цей пункт.
                 looks_like_contract = 'контракт' in out_name.lower()
                 if not b64:
                     continue
@@ -353,7 +431,8 @@ def generate():
                         tvo_donor_bytes=tvo_donor_bytes,
                         add_tvo=file_add_tvo,
                         add_age_clause=add_age_clause,
-                        warn_if_age_clause_missing=looks_like_contract
+                        warn_if_age_clause_missing=looks_like_contract,
+                        leadership_active=leadership_active
                     )
                 except Exception as e:
                     err = ('Помилка обробки: ' + str(e)).encode('utf-8')
