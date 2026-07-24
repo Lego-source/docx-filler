@@ -13,7 +13,7 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-24-leadership-v10-onenote"
+APP_VERSION = "2026-07-24-leadership-v11-genitive-head"
 
 
 def normalize_name(s):
@@ -344,6 +344,41 @@ LEADERSHIP_MATCH = {
     },
 }
 
+# ⚠️ «ТВО» = «тимчасово виконуючий обов'язки [КОГО?]» — граматично вимагає
+# РОДОВОГО відмінка наступного слова, а не називного («ТВО командира»,
+# а не «ТВО командир»). Це базове, безвиняткове правило для цих іменників
+# чоловічого роду 2-ї відміни твердої групи (родовий = основа + «-а»).
+# Джерело підтвердження класифікації слів: словникові правила бібліотеки
+# shevchenko-ext-military (word-classifier-rules.json) — «командир»
+# (закінчення «-ир») і «начальник» (закінчення «-ик») обидва класифікуються
+# як masculine noun. Сам алгоритм відмінювання — у базовому пакеті
+# shevchenko (JS/TS, окрема залежність), який Python-сервер не виконує;
+# тому для цих конкретних, добре відомих слів відмінювання зроблено прямим
+# точковим словником, а не викликом зовнішньої бібліотеки.
+POSITION_HEAD_GENITIVE = {
+    'командир': 'командира',
+    'начальник': 'начальника',
+}
+
+
+def decline_position_phrase_to_genitive_(phrase):
+    """Відмінює ЛИШЕ перше слово фрази (голову словосполучення) в родовий
+       відмінок, залишаючи решту фрази («військової частини А5111»,
+       «штабу», «1030 зенітного...») без змін — вона вже граматично
+       узгоджена з головним словом і сама від відмінка голови не залежить."""
+    parts = phrase.split(None, 1)
+    if not parts:
+        return phrase
+    first = parts[0]
+    rest = parts[1] if len(parts) > 1 else ''
+    first_norm = normalize_for_anchor_(first)
+    genitive = POSITION_HEAD_GENITIVE.get(first_norm)
+    if genitive is None:
+        return phrase  # невідоме слово — безпечний відкат, нічого не ламаємо
+    if first[:1].isupper():
+        genitive = genitive[0].upper() + genitive[1:]
+    return genitive + (' ' + rest if rest else '')
+
 
 def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
@@ -469,9 +504,7 @@ def _initials_of(im):
 
 
 def apply_leadership_substitution(doc, leadership_active):
-    """Повертає діагностичний рядок (або None), якщо є що повідомити.
-       Викликач вирішує, куди складати ці нотатки (тепер — в один
-       спільний файл на людину, а не по одному на кожен документ)."""
+    """Повертає діагностичний рядок (або None), якщо є що повідомити."""
     if not leadership_active:
         return None
 
@@ -538,12 +571,21 @@ def apply_leadership_substitution(doc, leadership_active):
                 rank_row_hit = True
                 any_hit = True
 
+        # ⚠️ Позиція — тепер «ТВО » + ГОЛОВНЕ СЛОВО фрази у РОДОВОМУ
+        # відмінку (замість простого приліплення до називного).
         pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
-            if replace_pattern_everywhere(all_paragraphs, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
+            if replace_pattern_everywhere(
+                all_paragraphs, pat_pos,
+                lambda m: 'ТВО ' + decline_position_phrase_to_genitive_(m.group(0)),
+                touched_ids=touched_ids
+            ):
                 pos_hit = True
 
+        # Родовий контекст (напр. пункт контракту) — текст ТУТ уже в
+        # родовому відмінку в самому шаблоні, тому просто додаємо «ТВО »,
+        # без повторного відмінювання.
         genitive_hit = False
         if new_genitive_text and cfg.get('genitiveStandardText'):
             pat_gen_std = re.compile(_ws(cfg['genitiveStandardText']), re.IGNORECASE)
@@ -558,9 +600,6 @@ def apply_leadership_substitution(doc, leadership_active):
                     genitive_hit = True
                     any_hit = True
 
-        # Пишемо в діагностику ЛИШЕ якщо щось реально знайдено — «нічого
-        # не знайдено» для ролей, які просто не фігурують у цьому файлі,
-        # більше не засмічує спільний підсумковий файл.
         if any_hit:
             rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
             diag_lines.append(
@@ -644,9 +683,6 @@ def generate():
             tvo_donor_b64 = person.get('tvoDonorB64')
             tvo_donor_bytes = base64.b64decode(tvo_donor_b64) if tvo_donor_b64 else None
 
-            # ⚠️ Тепер збираємо нотатки ПО ВСІХ файлах цієї людини в один
-            # список, і пишемо ОДИН спільний .txt поруч із папкою — замість
-            # окремого .txt біля кожного документа.
             person_notes = []
 
             for f in person.get('files', []):
@@ -667,8 +703,6 @@ def generate():
                         leadership_active=leadership_active
                     )
                 except Exception as e:
-                    # Справжні збої обробки лишаємо ОДРАЗУ біля конкретного
-                    # файлу — це критично й має бути видно без пошуку.
                     err = ('Помилка обробки: ' + str(e)).encode('utf-8')
                     path = (folder + '/' if folder else '') + out_name + '.ERROR.txt'
                     zf.writestr(path, err)
