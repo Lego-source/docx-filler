@@ -679,7 +679,7 @@ def generate():
                     person_notes.append(out_name + ':\n' + note)
 
             if person_notes:
-                summary_name = (sanitize_for_filename_(folder) if folder else 'УВАГА') + '_УВАГА.txt'
+                summary_name = (sanitize_for_filename_(folder) if folder else 'ХідЗаміни') + '_ХідЗаміни.txt'
                 zf.writestr(summary_name, ('\n\n'.join(person_notes)).encode('utf-8'))
 
     return Response(
