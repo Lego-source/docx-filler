@@ -13,7 +13,7 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-23-leadership-v6-idtrack-ROLLBACK"
+APP_VERSION = "2026-07-24-leadership-v8-stable-ids"
 
 
 # ---------- Нормалізація ----------
@@ -61,7 +61,7 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Обхід абзаців ----------
+# ---------- Обхід абзаців/таблиць ----------
 
 def collect_paragraphs(container):
     paras = []
@@ -80,6 +80,8 @@ def collect_paragraphs(container):
 
 
 def collect_paragraphs_dedup(container):
+    """Дедублікація за id XML-елемента — важливо для об'єднаних клітинок
+       (gridSpan), де python-docx повертає той самий <w:p> кілька разів."""
     paras = []
     seen = set()
 
@@ -102,6 +104,25 @@ def collect_paragraphs_dedup(container):
 
     _walk(container)
     return paras
+
+
+def collect_all_paragraphs_incl_headers(doc):
+    """Один-єдиний, ПОВНИЙ список абзаців (тіло+таблиці+колонтитули),
+       обчислений ОДИН РАЗ. Це критично: python-docx створює НОВІ Python-
+       обгортки навколо XML-елементів при кожному зверненні до .paragraphs/
+       .cells, і id() цих обгорток може випадково збігатися з id() уже
+       знищеної збирачем сміття обгортки з попереднього сканування —
+       тому весь подальший код працює з ОДНИМ, повторно використовуваним
+       списком, а не пересканує документ на кожному кроці."""
+    result = list(collect_paragraphs_dedup(doc))
+    for container in all_containers(doc):
+        if container is doc:
+            continue
+        try:
+            result.extend(collect_paragraphs_dedup(container))
+        except Exception:
+            pass
+    return result
 
 
 def walk_all_tables(container):
@@ -133,18 +154,8 @@ def all_containers(doc):
     return containers
 
 
-def full_doc_text_lower(doc):
-    parts = []
-    for p in collect_paragraphs_dedup(doc):
-        parts.append(''.join(r.text for r in p.runs))
-    for container in all_containers(doc):
-        if container is doc:
-            continue
-        try:
-            for p in collect_paragraphs_dedup(container):
-                parts.append(''.join(r.text for r in p.runs))
-        except Exception:
-            pass
+def full_doc_text_lower(all_paragraphs):
+    parts = [''.join(r.text for r in p.runs) for p in all_paragraphs]
     return normalize_for_anchor_(' '.join(parts))
 
 
@@ -341,7 +352,7 @@ def insert_age_clause(doc):
 LEADERSHIP_MATCH = {
     'komPolku': {
         'zvannia': 'майор', 'im': 'Максим', 'fam': 'ЗАЙЧЕНКО',
-        'posPrefixes': ['Командир 1030'],
+        'posPrefixes': ['Командир 1030', 'Командир військової частини А5273'],
     },
     'nachShtabu': {
         'zvannia': 'старший лейтенант', 'im': 'Євген', 'fam': 'СВИРИДОВ',
@@ -357,13 +368,6 @@ LEADERSHIP_MATCH = {
 
 def _ws(s):
     return r'[\s\u00A0]+'.join(re.escape(w) for w in s.split())
-
-
-def paragraph_already_touched(paragraph):
-    for r in paragraph.runs:
-        if r.text and r.font.highlight_color == WD_COLOR_INDEX.YELLOW:
-            return True
-    return False
 
 
 def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True, touched_ids=None):
@@ -432,28 +436,23 @@ def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True, 
     return True
 
 
-def replace_pattern_everywhere(doc, pattern, repl_func, highlight=True, touched_ids=None):
+def replace_pattern_everywhere(all_paragraphs, pattern, repl_func, highlight=True, touched_ids=None):
+    """⚠️ Приймає ГОТОВИЙ, заздалегідь обчислений список абзаців (не doc!) —
+       щоб id() абзаців лишався стабільним протягом усієї обробки одного
+       документа. Пересканування doc.tables/.paragraphs на кожному кроці
+       призводило до випадкових, непередбачуваних збігів id() між різними
+       абзацами через повторне використання Python пам'яті."""
     changed = False
-    for p in collect_paragraphs_dedup(doc):
+    for p in all_paragraphs:
         if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight, touched_ids=touched_ids):
             changed = True
-    for container in all_containers(doc):
-        if container is doc:
-            continue
-        try:
-            for p in collect_paragraphs_dedup(container):
-                if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight, touched_ids=touched_ids):
-                    changed = True
-        except Exception:
-            pass
     return changed
 
 
-def replace_rank_in_same_row(doc, old_rank_norm, new_rank, name_pattern, touched_ids=None):
+def replace_rank_in_same_row(all_tables, old_rank_norm, new_rank, name_pattern, touched_ids=None):
     changed = False
     seen_rows = set()
-    tables = walk_all_tables(doc)
-    for table in tables:
+    for table in all_tables:
         for row in table.rows:
             row_id = id(row._tr)
             if row_id in seen_rows:
@@ -499,6 +498,11 @@ def apply_leadership_substitution(doc, leadership_active):
     if not leadership_active:
         return None
 
+    # ОДИН РАЗ на весь виклик — і абзаци, і таблиці. Усі наступні кроки
+    # переговорюють ЦИМИ САМИМИ об'єктами, а не пересканують doc заново.
+    all_paragraphs = collect_all_paragraphs_incl_headers(doc)
+    all_tables = walk_all_tables(doc)
+
     diag_lines = []
     full_text_norm = None
     touched_ids = set()
@@ -530,7 +534,7 @@ def apply_leadership_substitution(doc, leadership_active):
                 _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['initialsFam']) +
                 r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.'
             )
-            if replace_pattern_everywhere(doc, pat_init_full,
+            if replace_pattern_everywhere(all_paragraphs, pat_init_full,
                     lambda m: new_zv + ' ' + new_fam + ' ' + new_initials + '.',
                     touched_ids=touched_ids):
                 any_hit = True
@@ -540,18 +544,18 @@ def apply_leadership_substitution(doc, leadership_active):
             _ws(cfg['zvannia']) + r'[\s\u00A0]+' + _ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']),
             re.IGNORECASE
         )
-        if replace_pattern_everywhere(doc, pat_full, lambda m: new_zv + ' ' + new_name, touched_ids=touched_ids):
+        if replace_pattern_everywhere(all_paragraphs, pat_full, lambda m: new_zv + ' ' + new_name, touched_ids=touched_ids):
             any_hit = True
             rank_combined_hit = True
 
         pat_name = re.compile(_ws(cfg['im']) + r'[\s\u00A0]+' + _ws(cfg['fam']), re.IGNORECASE)
-        name_replaced = replace_pattern_everywhere(doc, pat_name, lambda m: new_name, touched_ids=touched_ids)
+        name_replaced = replace_pattern_everywhere(all_paragraphs, pat_name, lambda m: new_name, touched_ids=touched_ids)
         if name_replaced:
             any_hit = True
 
         if cfg.get('initialsFam'):
             pat_init_bare = re.compile(_ws(cfg['initialsFam']) + r'[\s\u00A0]+[А-ЯІЇЄҐ]\.\s*[А-ЯІЇЄҐ]\.')
-            if replace_pattern_everywhere(doc, pat_init_bare,
+            if replace_pattern_everywhere(all_paragraphs, pat_init_bare,
                     lambda m: new_fam + ' ' + new_initials + '.', touched_ids=touched_ids):
                 any_hit = True
 
@@ -559,16 +563,15 @@ def apply_leadership_substitution(doc, leadership_active):
         if not rank_combined_hit and name_replaced:
             old_rank_norm = normalize_for_anchor_(cfg['zvannia'])
             new_name_pattern = re.compile(_ws(new_im) + r'[\s\u00A0]+' + _ws(new_fam))
-            if replace_rank_in_same_row(doc, old_rank_norm, new_zv, new_name_pattern, touched_ids=touched_ids):
+            if replace_rank_in_same_row(all_tables, old_rank_norm, new_zv, new_name_pattern, touched_ids=touched_ids):
                 rank_row_hit = True
                 any_hit = True
 
         pos_hit = False
         for prefix in cfg.get('posPrefixes', []):
             pat_pos = re.compile(_ws(prefix))
-            if replace_pattern_everywhere(doc, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
+            if replace_pattern_everywhere(all_paragraphs, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
                 pos_hit = True
-                any_hit = True
 
         if any_hit:
             rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
@@ -578,7 +581,7 @@ def apply_leadership_substitution(doc, leadership_active):
             )
         else:
             if full_text_norm is None:
-                full_text_norm = full_doc_text_lower(doc)
+                full_text_norm = full_doc_text_lower(all_paragraphs)
             std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
             diag_lines.append(
                 '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
