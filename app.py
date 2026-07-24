@@ -13,7 +13,7 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-24-leadership-v9-genitive"
+APP_VERSION = "2026-07-24-leadership-v10-onenote"
 
 
 def normalize_name(s):
@@ -326,8 +326,6 @@ def insert_age_clause(doc):
     return False
 
 
-# ---------- ТВО-керівництва (пряма текстова заміна з підсвіткою) ----------
-
 LEADERSHIP_MATCH = {
     'komPolku': {
         'zvannia': 'майор', 'im': 'Максим', 'fam': 'ЗАЙЧЕНКО',
@@ -341,8 +339,6 @@ LEADERSHIP_MATCH = {
     'komKorpusu': {
         'zvannia': 'бригадний генерал', 'im': 'Андрій', 'fam': 'БІЛЕЦЬКИЙ',
         'posPrefixes': ['Командир 3 армійського', 'Командир військової частини А5111'],
-        # Родовий відмінок (окремий контекст у контракті):
-        # «Командира військової частини А5111» / «бригадного генерала БІЛЕЦЬКОГО Андрія Євгенійовича»
         'genitivePosPrefixes': ['Командира військової частини А5111'],
         'genitiveStandardText': 'бригадного генерала БІЛЕЦЬКОГО Андрія Євгенійовича',
     },
@@ -473,6 +469,9 @@ def _initials_of(im):
 
 
 def apply_leadership_substitution(doc, leadership_active):
+    """Повертає діагностичний рядок (або None), якщо є що повідомити.
+       Викликач вирішує, куди складати ці нотатки (тепер — в один
+       спільний файл на людину, а не по одному на кожен документ)."""
     if not leadership_active:
         return None
 
@@ -493,15 +492,7 @@ def apply_leadership_substitution(doc, leadership_active):
         new_bat = (override.get('bat') or '').strip()
         new_genitive_text = (override.get('genitiveText') or '').strip()
 
-        diag_lines.append(
-            'Отримано ТВО для ролі «' + role_key + '»: звання=«' + new_zv +
-            '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»' +
-            (', по батькові=«' + new_bat + '»' if new_bat else '') +
-            (', родовий текст=«' + new_genitive_text + '»' if new_genitive_text else '')
-        )
-
         if not new_im or not new_fam:
-            diag_lines.append('  -> ПРОПУЩЕНО: не передано ім\'я або прізвище заступника.')
             continue
 
         new_name = new_im + ' ' + new_fam
@@ -553,7 +544,6 @@ def apply_leadership_substitution(doc, leadership_active):
             if replace_pattern_everywhere(all_paragraphs, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
                 pos_hit = True
 
-        # ---- Родовий відмінок (окремий контекст, напр. пункт контракту) ----
         genitive_hit = False
         if new_genitive_text and cfg.get('genitiveStandardText'):
             pat_gen_std = re.compile(_ws(cfg['genitiveStandardText']), re.IGNORECASE)
@@ -568,22 +558,15 @@ def apply_leadership_substitution(doc, leadership_active):
                     genitive_hit = True
                     any_hit = True
 
+        # Пишемо в діагностику ЛИШЕ якщо щось реально знайдено — «нічого
+        # не знайдено» для ролей, які просто не фігурують у цьому файлі,
+        # більше не засмічує спільний підсумковий файл.
         if any_hit:
             rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
             diag_lines.append(
-                '  -> ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' + rank_status +
-                ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') +
+                'Роль «' + role_key + '» (' + new_zv + ' ' + new_name + '): ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' +
+                rank_status + ', посада: ' + ('так' if pos_hit else 'НІ') +
                 (', родовий: ' + ('так' if genitive_hit else 'НІ') if new_genitive_text else '') + ').'
-            )
-        else:
-            if full_text_norm is None:
-                full_text_norm = full_doc_text_lower(all_paragraphs)
-            std_name_present = normalize_for_anchor_(cfg['fam']) in full_text_norm
-            diag_lines.append(
-                '  -> НІЧОГО НЕ ЗНАЙДЕНО в цьому файлі. ' +
-                ('Стандартне ім\'я «' + cfg['fam'] + '» в документі Є, але жоден патерн не збігся.'
-                 if std_name_present else
-                 'Стандартного імені «' + cfg['fam'] + '» в цьому документі взагалі немає — ця роль тут не фігурує.')
             )
 
     return '\n'.join(diag_lines) if diag_lines else None
@@ -661,6 +644,11 @@ def generate():
             tvo_donor_b64 = person.get('tvoDonorB64')
             tvo_donor_bytes = base64.b64decode(tvo_donor_b64) if tvo_donor_b64 else None
 
+            # ⚠️ Тепер збираємо нотатки ПО ВСІХ файлах цієї людини в один
+            # список, і пишемо ОДИН спільний .txt поруч із папкою — замість
+            # окремого .txt біля кожного документа.
+            person_notes = []
+
             for f in person.get('files', []):
                 out_name = f.get('outName', 'file.docx')
                 b64 = f.get('templateB64', '')
@@ -679,6 +667,8 @@ def generate():
                         leadership_active=leadership_active
                     )
                 except Exception as e:
+                    # Справжні збої обробки лишаємо ОДРАЗУ біля конкретного
+                    # файлу — це критично й має бути видно без пошуку.
                     err = ('Помилка обробки: ' + str(e)).encode('utf-8')
                     path = (folder + '/' if folder else '') + out_name + '.ERROR.txt'
                     zf.writestr(path, err)
@@ -686,13 +676,21 @@ def generate():
                 path = (folder + '/' if folder else '') + out_name
                 zf.writestr(path, filled)
                 if note:
-                    zf.writestr(path + '.УВАГА.txt', note.encode('utf-8'))
+                    person_notes.append(out_name + ':\n' + note)
+
+            if person_notes:
+                summary_name = (sanitize_for_filename_(folder) if folder else 'УВАГА') + '_УВАГА.txt'
+                zf.writestr(summary_name, ('\n\n'.join(person_notes)).encode('utf-8'))
 
     return Response(
         mem.getvalue(),
         mimetype='application/zip',
         headers={'Content-Disposition': 'attachment; filename="result.zip"'}
     )
+
+
+def sanitize_for_filename_(s):
+    return re.sub(r'[\\/:*?"<>|]', '_', s or '').strip()
 
 
 if __name__ == '__main__':
