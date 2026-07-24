@@ -13,10 +13,8 @@ from docx.enum.text import WD_COLOR_INDEX
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-APP_VERSION = "2026-07-24-leadership-v8-stable-ids"
+APP_VERSION = "2026-07-24-leadership-v9-genitive"
 
-
-# ---------- Нормалізація ----------
 
 def normalize_name(s):
     s = (s or '')
@@ -61,8 +59,6 @@ def build_matcher(data_map):
     return pattern, lookup
 
 
-# ---------- Обхід абзаців/таблиць ----------
-
 def collect_paragraphs(container):
     paras = []
     try:
@@ -80,8 +76,6 @@ def collect_paragraphs(container):
 
 
 def collect_paragraphs_dedup(container):
-    """Дедублікація за id XML-елемента — важливо для об'єднаних клітинок
-       (gridSpan), де python-docx повертає той самий <w:p> кілька разів."""
     paras = []
     seen = set()
 
@@ -107,13 +101,6 @@ def collect_paragraphs_dedup(container):
 
 
 def collect_all_paragraphs_incl_headers(doc):
-    """Один-єдиний, ПОВНИЙ список абзаців (тіло+таблиці+колонтитули),
-       обчислений ОДИН РАЗ. Це критично: python-docx створює НОВІ Python-
-       обгортки навколо XML-елементів при кожному зверненні до .paragraphs/
-       .cells, і id() цих обгорток може випадково збігатися з id() уже
-       знищеної збирачем сміття обгортки з попереднього сканування —
-       тому весь подальший код працює з ОДНИМ, повторно використовуваним
-       списком, а не пересканує документ на кожному кроці."""
     result = list(collect_paragraphs_dedup(doc))
     for container in all_containers(doc):
         if container is doc:
@@ -158,8 +145,6 @@ def full_doc_text_lower(all_paragraphs):
     parts = [''.join(r.text for r in p.runs) for p in all_paragraphs]
     return normalize_for_anchor_(' '.join(parts))
 
-
-# ---------- Заміна плейсхолдерів «...» ----------
 
 def replace_in_paragraph(paragraph, pattern, lookup):
     runs = paragraph.runs
@@ -225,8 +210,6 @@ def apply_placeholders(doc, data_map):
                 pass
 
 
-# ---------- Вставка нового абзацу після якоря ----------
-
 def insert_paragraph_after(anchor_paragraph, text):
     new_p = copy.deepcopy(anchor_paragraph._p)
     anchor_paragraph._p.addnext(new_p)
@@ -240,8 +223,6 @@ def insert_paragraph_after(anchor_paragraph, text):
         new_para.add_run(text)
     return new_para
 
-
-# ---------- ТВО-вставка (блок "Прошу покласти тимчасове виконання...") ----------
 
 TVO_A_MARK   = 'прошу покласти тимчасове виконання'
 TVO_B_START  = 'не заперечую'
@@ -322,8 +303,6 @@ def insert_tvo_block(target_doc, donor_doc):
     return True, None
 
 
-# ---------- Пункт 8 контракту для військовослужбовців 45+ ----------
-
 AGE_CLAUSE_ANCHOR_NORM = 'спяніння'
 
 AGE_CLAUSE_TEXT = (
@@ -362,6 +341,10 @@ LEADERSHIP_MATCH = {
     'komKorpusu': {
         'zvannia': 'бригадний генерал', 'im': 'Андрій', 'fam': 'БІЛЕЦЬКИЙ',
         'posPrefixes': ['Командир 3 армійського', 'Командир військової частини А5111'],
+        # Родовий відмінок (окремий контекст у контракті):
+        # «Командира військової частини А5111» / «бригадного генерала БІЛЕЦЬКОГО Андрія Євгенійовича»
+        'genitivePosPrefixes': ['Командира військової частини А5111'],
+        'genitiveStandardText': 'бригадного генерала БІЛЕЦЬКОГО Андрія Євгенійовича',
     },
 }
 
@@ -437,11 +420,6 @@ def regex_replace_with_highlight(paragraph, pattern, repl_func, highlight=True, 
 
 
 def replace_pattern_everywhere(all_paragraphs, pattern, repl_func, highlight=True, touched_ids=None):
-    """⚠️ Приймає ГОТОВИЙ, заздалегідь обчислений список абзаців (не doc!) —
-       щоб id() абзаців лишався стабільним протягом усієї обробки одного
-       документа. Пересканування doc.tables/.paragraphs на кожному кроці
-       призводило до випадкових, непередбачуваних збігів id() між різними
-       абзацами через повторне використання Python пам'яті."""
     changed = False
     for p in all_paragraphs:
         if regex_replace_with_highlight(p, pattern, repl_func, highlight=highlight, touched_ids=touched_ids):
@@ -498,8 +476,6 @@ def apply_leadership_substitution(doc, leadership_active):
     if not leadership_active:
         return None
 
-    # ОДИН РАЗ на весь виклик — і абзаци, і таблиці. Усі наступні кроки
-    # переговорюють ЦИМИ САМИМИ об'єктами, а не пересканують doc заново.
     all_paragraphs = collect_all_paragraphs_incl_headers(doc)
     all_tables = walk_all_tables(doc)
 
@@ -514,10 +490,14 @@ def apply_leadership_substitution(doc, leadership_active):
         new_zv = (override.get('zvannia') or '').strip()
         new_im = (override.get('im') or '').strip()
         new_fam = (override.get('fam') or '').strip().upper()
+        new_bat = (override.get('bat') or '').strip()
+        new_genitive_text = (override.get('genitiveText') or '').strip()
 
         diag_lines.append(
             'Отримано ТВО для ролі «' + role_key + '»: звання=«' + new_zv +
-            '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»'
+            '», ім\'я=«' + new_im + '», прізвище=«' + new_fam + '»' +
+            (', по батькові=«' + new_bat + '»' if new_bat else '') +
+            (', родовий текст=«' + new_genitive_text + '»' if new_genitive_text else '')
         )
 
         if not new_im or not new_fam:
@@ -573,11 +553,27 @@ def apply_leadership_substitution(doc, leadership_active):
             if replace_pattern_everywhere(all_paragraphs, pat_pos, lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
                 pos_hit = True
 
+        # ---- Родовий відмінок (окремий контекст, напр. пункт контракту) ----
+        genitive_hit = False
+        if new_genitive_text and cfg.get('genitiveStandardText'):
+            pat_gen_std = re.compile(_ws(cfg['genitiveStandardText']), re.IGNORECASE)
+            if replace_pattern_everywhere(all_paragraphs, pat_gen_std,
+                    lambda m: new_genitive_text, touched_ids=touched_ids):
+                genitive_hit = True
+                any_hit = True
+            for prefix in cfg.get('genitivePosPrefixes', []):
+                pat_gen_pos = re.compile(_ws(prefix))
+                if replace_pattern_everywhere(all_paragraphs, pat_gen_pos,
+                        lambda m: 'ТВО ' + m.group(0), touched_ids=touched_ids):
+                    genitive_hit = True
+                    any_hit = True
+
         if any_hit:
             rank_status = 'разом з іменем' if rank_combined_hit else ('в сусідній клітинці рядка' if rank_row_hit else 'НЕ ЗНАЙДЕНО окремо')
             diag_lines.append(
                 '  -> ЗНАЙДЕНО і замінено (ПІБ: так, звання: ' + rank_status +
-                ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') + ').'
+                ', посада: ' + ('так' if pos_hit else 'НІ — якір посади не знайдено') +
+                (', родовий: ' + ('так' if genitive_hit else 'НІ') if new_genitive_text else '') + ').'
             )
         else:
             if full_text_norm is None:
@@ -592,8 +588,6 @@ def apply_leadership_substitution(doc, leadership_active):
 
     return '\n'.join(diag_lines) if diag_lines else None
 
-
-# ---------- Заповнення одного документа ----------
 
 def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
                   add_age_clause=False, warn_if_age_clause_missing=False,
@@ -634,8 +628,6 @@ def fill_document(docx_bytes, data_map, tvo_donor_bytes=None, add_tvo=False,
 
     return out.getvalue(), note
 
-
-# ---------- Маршрути ----------
 
 @app.route('/', methods=['GET'])
 def root():
